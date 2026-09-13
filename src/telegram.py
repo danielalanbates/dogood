@@ -4,7 +4,8 @@ Outbound: notify Daniel about GitHub events.
 Inbound:  pipe Daniel's messages to Claude Code for intelligent processing.
 """
 
-import subprocess
+import urllib.request
+import urllib.parse
 import json
 import time
 import re
@@ -12,16 +13,42 @@ import os
 from datetime import datetime
 from collections import deque
 from pathlib import Path
+from dotenv import load_dotenv
 
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
-API_URL = f"{BASE_URL}/sendMessage"
+# Load .env file if it exists
+load_dotenv(override=True)
 
-PROJECT_DIR = "/Volumes/X10 Pro danielalanbatesatgmail.com /AIcode/dogood"
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+if not BOT_TOKEN or not CHAT_ID:
+    # If we're in a module that's imported, we might not want to exit immediately,
+    # but for a daemon it's better to fail early with a clear message.
+    print("ERROR: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set in environment", flush=True)
+
+BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
+API_URL = f"{BASE_URL}/sendMessage" if BASE_URL else ""
+
+PROJECT_DIR = "/Users/daniel/Library/Mobile Documents/com~apple~CloudDocs/Code/Tools/github-helper"
 
 TELEGRAM_INBOX = "/tmp/telegram-inbox.jsonl"
 TELEGRAM_OUTBOX = "/tmp/telegram-outbox.jsonl"
+
+
+def _make_request(url: str, data: dict, timeout: int = 15) -> dict:
+    """Helper to make urllib POST requests and return JSON dict."""
+    try:
+        req = urllib.request.Request(url, method="POST")
+        req.add_header('Content-Type', 'application/json')
+        payload = json.dumps(data).encode('utf-8')
+        with urllib.request.urlopen(req, data=payload, timeout=timeout) as response:
+            resp_body = response.read().decode('utf-8')
+            return json.loads(resp_body)
+    except urllib.error.HTTPError as e:
+        print(f"  [TELEGRAM] HTTP Error {e.code}: {e.read().decode('utf-8', errors='ignore')}", flush=True)
+    except Exception as e:
+        print(f"  [TELEGRAM] Request exception: {e}", flush=True)
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -30,37 +57,23 @@ TELEGRAM_OUTBOX = "/tmp/telegram-outbox.jsonl"
 
 def notify(message: str) -> bool:
     """Send a Telegram message to Daniel. Returns True on success."""
-    try:
-        result = subprocess.run(
-            ["curl", "-s", API_URL,
-             "-d", f"chat_id={CHAT_ID}",
-             "-d", f"text={message}",
-             "-d", "parse_mode=Markdown"],
-            capture_output=True, text=True, timeout=15
-        )
-        if result.returncode == 0:
-            resp = json.loads(result.stdout)
-            return resp.get("ok", False)
-    except Exception:
-        pass
-    return False
+    data = {
+        "chat_id": CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown"
+    }
+    resp = _make_request(API_URL, data)
+    return resp.get("ok", False)
 
 
 def notify_plain(message: str) -> bool:
     """Send a plain-text Telegram message (no Markdown parsing issues)."""
-    try:
-        result = subprocess.run(
-            ["curl", "-s", API_URL,
-             "-d", f"chat_id={CHAT_ID}",
-             "-d", f"text={message}"],
-            capture_output=True, text=True, timeout=15
-        )
-        if result.returncode == 0:
-            resp = json.loads(result.stdout)
-            return resp.get("ok", False)
-    except Exception:
-        pass
-    return False
+    data = {
+        "chat_id": CHAT_ID,
+        "text": message
+    }
+    resp = _make_request(API_URL, data)
+    return resp.get("ok", False)
 
 
 def notify_github_attention(event_type: str, repo: str, url: str, summary: str):
@@ -68,11 +81,9 @@ def notify_github_attention(event_type: str, repo: str, url: str, summary: str):
     emoji = {
         "payment_request": "\U0001f4b0",
         "job_inquiry": "\U0001f4bc",
-        "question": "\u2753",
-        "review_needs_human": "\U0001f440",
         "contact_request": "\U0001f4e7",
-        "bounty_found": "\U0001f3af",
-        "pr_merged": "\u2705",
+        "cla_request": "\U0001f4dd",
+        "sponsor": "\U0001f4b0",
     }.get(event_type, "\U0001f4e2")
 
     msg = f"{emoji} *{event_type.replace('_', ' ').title()}*\n"
@@ -89,21 +100,14 @@ def notify_github_attention(event_type: str, repo: str, url: str, summary: str):
 
 def get_updates(offset: int = 0, timeout: int = 30) -> list:
     """Long-poll Telegram for new messages from Daniel."""
-    try:
-        result = subprocess.run(
-            ["curl", "-s", f"{BASE_URL}/getUpdates",
-             "-d", f"offset={offset}",
-             "-d", f"timeout={timeout}",
-             "-d", "allowed_updates=[\"message\"]"],
-            capture_output=True, text=True, timeout=timeout + 10
-        )
-        if result.returncode == 0:
-            resp = json.loads(result.stdout)
-            if resp.get("ok"):
-                return resp.get("result", [])
-    except Exception:
-        pass
-    return []
+    url = f"{BASE_URL}/getUpdates"
+    data = {
+        "offset": offset,
+        "timeout": timeout,
+        "allowed_updates": ["message"]
+    }
+    resp = _make_request(url, data, timeout=timeout + 10)
+    return resp.get("result", [])
 
 
 def extract_github_url(text: str) -> str | None:
@@ -222,6 +226,15 @@ class TelegramDaemon:
             "You are Claude, Daniel Bates' AI assistant. Daniel is messaging you via Telegram.\n"
             "You manage dogood — an autonomous agent factory that finds and fixes "
             "bugs on open-source projects.\n\n"
+            "CRITICAL: You are running LOCALLY on Daniel's MacBook. You have FULL access to "
+            "his machine via the Bash tool. You CAN and SHOULD execute commands directly.\n\n"
+            "ESCALATION TO MAIN CLI SESSION:\n"
+            "- Daniel has an interactive Claude Code session running in his terminal\n"
+            "- For BIG tasks (large refactors, multi-step projects, anything that would take >2 min),\n"
+            "  escalate to the main session by writing to /tmp/telegram-escalated-tasks.jsonl\n"
+            "- Write a JSON line: {\"timestamp\": \"ISO8601\", \"task\": \"description\", \"from\": \"telegram\"}\n"
+            "- Then tell Daniel: 'This is a big job — I have escalated it to the main CLI session.'\n"
+            "- Small tasks (status checks, quick queries, sending a comment) — handle yourself directly\n\n"
             "RULES:\n"
             "- Keep responses concise and Telegram-friendly (under 2000 chars)\n"
             "- If Daniel asks about status, query the SQLite DB at data/github_helper.db\n"
@@ -238,13 +251,14 @@ class TelegramDaemon:
             cmd = [
                 "claude", "-p", full_prompt,
                 "--system-prompt", system_prompt,
-                "--model", "haiku",
+                "--model", "claude-fable-5-1",
+                "--effort", "low",
                 "--allowedTools", "Bash,Read,Glob,Grep",
                 "--add-dir", PROJECT_DIR,
                 "--no-session-persistence",
             ]
 
-            print(f"[{ts}] -> claude -p (haiku)...", flush=True)
+            print(f"[{ts}] -> claude -p (fable-5-1)...", flush=True)
             env = {k: v for k, v in os.environ.items()
                    if "CLAUDE" not in k.upper()}
             env["PATH"] = os.environ.get("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")

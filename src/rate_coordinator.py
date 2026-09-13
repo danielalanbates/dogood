@@ -92,33 +92,9 @@ def _maybe_notify(state: dict, agent_id: str):
     except (json.JSONDecodeError, OSError):
         pass
 
-    # Send the alert
-    try:
-        import subprocess
-        bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-        chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
-        if not bot_token or not chat_id:
-            return
-
-        agents_hit = set(r["agent"] for r in recent_reporters)
-        msg = (
-            f"⚠️ Rate Limit Alert\n"
-            f"{len(recent_reporters)} hits in last 10 min\n"
-            f"Agents affected: {len(agents_hit)}\n"
-            f"Latest: {agent_id}\n"
-            f"Total hits: {state.get('hit_count', 0)}\n"
-            f"Agents are coordinating retries."
-        )
-        subprocess.run(
-            ["curl", "-s", f"https://api.telegram.org/bot{bot_token}/sendMessage",
-             "-d", f"chat_id={chat_id}",
-             "-d", f"text={msg}"],
-            capture_output=True, text=True, timeout=10
-        )
-        # Record notification time
-        NOTIFY_COOLDOWN_FILE.write_text(json.dumps({"time": now}))
-    except Exception:
-        pass
+    # Log rate limit alert locally only (CEO only wants payment/CLA/info-request alerts)
+    agents_hit = set(r["agent"] for r in recent_reporters)
+    print(f"  [RATE LIMIT] {len(recent_reporters)} hits in 10 min, {len(agents_hit)} agents affected, latest: {agent_id}", flush=True)
 
 
 def is_in_cooldown() -> bool:

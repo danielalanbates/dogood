@@ -19,7 +19,87 @@ from src.db import (
     get_contribution_by_pr_url, update_feedback_status,
 )
 from src.utils import now_iso
-from src.telegram import notify_github_attention
+from src.telegram import notify_github_attention, notify_plain
+
+
+def _generate_ai_response(sentiment: str, reviewer_comment: str, reviewer: str,
+                           repo_full_name: str, pr_number: str) -> str:
+    """Generate a contextual AI response using Claude CLI (OAuth/subscription auth)."""
+    import shutil
+
+    if not shutil.which("claude"):
+        print("  claude CLI not found, skipping AI response", flush=True)
+        return ""
+
+    guidelines = {
+        "positive": (
+            "The reviewer left a positive comment on our PR. Write a warm, genuine "
+            "thank-you response. Be brief (1-3 sentences). Match their energy and tone. "
+            "If they mentioned specific things they liked, acknowledge those."
+        ),
+        "constructive": (
+            "The reviewer left constructive feedback on our PR. Acknowledge their feedback "
+            "thoughtfully, let them know we'll address their points. Be specific about what "
+            "they raised. Keep it brief and professional (2-4 sentences)."
+        ),
+        "hostile": (
+            "The reviewer was hostile or anti-AI. Write a gracious, dignified exit message. "
+            "Thank them for their time, say we'll withdraw the PR, and wish the project well. "
+            "Do NOT be defensive or argue. Be kind and brief (2-3 sentences)."
+        ),
+        "sponsor": (
+            "The reviewer mentioned sponsoring, donating, or financially supporting our work. "
+            "Express genuine gratitude. Be warm but not over-the-top. Brief (1-3 sentences)."
+        ),
+        "regretful": (
+            "The reviewer previously rejected us but is now reconsidering or apologizing. "
+            "Be gracious and welcoming. No grudges. Express willingness to help. "
+            "Brief (1-3 sentences)."
+        ),
+        "payment_request": (
+            "The reviewer is asking about payment or bounty payouts. Thank them and direct "
+            "them to email daniel@batesai.org for payment details. Brief (1-2 sentences)."
+        ),
+        "job_inquiry": (
+            "The reviewer is offering a job or freelance opportunity. Thank them for the "
+            "opportunity and direct them to email daniel@batesai.org to discuss. "
+            "Brief (1-2 sentences)."
+        ),
+        "contact_request": (
+            "The reviewer wants to get in touch. Thank them and provide daniel@batesai.org "
+            "as the best contact. Brief (1-2 sentences)."
+        ),
+    }
+
+    guideline = guidelines.get(sentiment, guidelines["constructive"])
+
+    prompt = (
+        f"You are responding to a GitHub PR review comment as an open-source contributor "
+        f"named Daniel (github: danielalanbates). You contribute to open-source projects "
+        f"to help the community.\n\n"
+        f"Repo: {repo_full_name}\n"
+        f"PR: #{pr_number}\n"
+        f"Reviewer: @{reviewer}\n"
+        f"Their comment:\n{reviewer_comment[:1000]}\n\n"
+        f"Guidelines: {guideline}\n\n"
+        f"IMPORTANT: Reply in the same language the reviewer used. If they wrote in "
+        f"Japanese, reply in Japanese. If Spanish, reply in Spanish. Etc.\n\n"
+        f"Write ONLY the response text. No markdown headers, no quotes, no meta-commentary."
+    )
+
+    try:
+        result = subprocess.run(
+            ["claude", "-p", prompt, "--model", "claude-fable-5-1",
+             "--effort", "low",
+             "--max-turns", "1", "--output-format", "text"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception as e:
+        print(f"  AI response generation failed: {e}", flush=True)
+
+    return ""
 
 
 # Polite exit template
@@ -50,7 +130,10 @@ POSITIVE_KEYWORDS = {
 }
 SPONSOR_KEYWORDS = {
     "sponsor", "sponsoring", "donate", "donation", "fund", "funding",
-    "support you", "buy you a coffee", "tip", "patreon", "ko-fi",
+    "support you", "buy you a coffee", "buy me a coffee", "buymeacoffee",
+    "tip", "patreon", "ko-fi", "kofi", "coffee link", "buy a coffee",
+    "support your work", "support this project", "contribute financially",
+    "github sponsors", "open collective",
 }
 REGRET_KEYWORDS = {
     "sorry", "apologize", "apologies", "my bad", "overreacted",
@@ -59,8 +142,12 @@ REGRET_KEYWORDS = {
 }
 # Keywords that mean Daniel needs to be notified via Telegram
 CONTACT_KEYWORDS = {
-    "email", "contact", "reach out", "get in touch", "message me",
-    "dm me", "direct message", "how can i reach", "talk to you",
+    "email me", "email you", "send me an email", "send you an email",
+    "your email", "my email is", "contact me", "contact you",
+    "reach out to me", "reach out to you", "get in touch with me",
+    "get in touch with you", "message me", "dm me", "direct message",
+    "how can i reach", "talk to you", "how do i contact",
+    "what is your email", "what's your email",
 }
 PAYMENT_KEYWORDS = {
     "payment", "pay you", "paypal", "venmo", "bank", "invoice",
@@ -274,17 +361,34 @@ class FeedbackLoop:
             await asyncio.sleep(FEEDBACK_POLL_INTERVAL_SECONDS)
 
     def _fetch_notifications(self) -> list:
-        """Fetch GitHub notifications for our PRs."""
-        try:
-            result = subprocess.run(
-                ["gh", "api", "notifications",
-                 "--jq", '[.[] | select(.subject.type == "PullRequest")]'],
-                capture_output=True, text=True, timeout=30
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                return json.loads(result.stdout)
-        except Exception as e:
-            print(f"  Failed to fetch notifications: {e}")
+        """Fetch GitHub notifications, process PRs, and mark non-PR ones as read."""
+        for attempt in range(2):
+            try:
+                result = subprocess.run(
+                    ["gh", "api", "notifications"],
+                    capture_output=True, text=True, timeout=60
+                )
+                if result.returncode != 0 or not result.stdout.strip():
+                    return []
+
+                all_notifs = json.loads(result.stdout)
+                pr_notifs = []
+                for notif in all_notifs:
+                    if notif.get("subject", {}).get("type") == "PullRequest":
+                        pr_notifs.append(notif)
+                    else:
+                        # Mark non-PR notifications (CheckSuite, Issue, etc.) as read
+                        self._mark_notification_read(notif)
+
+                return pr_notifs
+            except subprocess.TimeoutExpired:
+                if attempt == 0:
+                    print("  gh api notifications timed out (60s), retrying...", flush=True)
+                    continue
+                print("  gh api notifications timed out on retry, skipping cycle", flush=True)
+            except Exception as e:
+                print(f"  Failed to fetch notifications: {e}")
+                break
         return []
 
     async def _process_notification(self, notif: dict) -> str | None:
@@ -294,6 +398,8 @@ class FeedbackLoop:
         repo_full_name = notif.get("repository", {}).get("full_name", "")
 
         if not pr_url:
+            # Still mark as read so it doesn't pile up
+            self._mark_notification_read(notif)
             return None
 
         # Fetch PR reviews and comments
@@ -302,7 +408,20 @@ class FeedbackLoop:
 
         all_feedback = reviews + comments
         if not all_feedback:
+            self._mark_notification_read(notif)
             return None
+
+        # Check DB for already-processed reviews to avoid duplicates
+        conn = self.pool.get()
+        processed_keys = set()
+        existing = conn.execute(
+            "SELECT pr_url, reviewer, body FROM pr_reviews WHERE pr_url = ?",
+            (pr_url,)
+        ).fetchall()
+        for row in existing:
+            processed_keys.add((row["pr_url"], row["reviewer"], row["body"][:200]))
+
+        result_sentiment = None
 
         for item in all_feedback:
             body = item.get("body", "")
@@ -313,7 +432,6 @@ class FeedbackLoop:
             # Skip bot accounts — their comments are automated, not human feedback
             user_type = item.get("user", {}).get("type", "")
             reviewer_lower = reviewer.lower()
-            # Strip [bot] suffix for matching (e.g. "coderabbitai[bot]" -> "coderabbitai")
             reviewer_base = reviewer_lower.replace("[bot]", "").rstrip("-")
             known_bots = {"claassistant", "cla-assistant", "allcontributors", "dependabot",
                           "renovate", "codecov", "coderabbitai", "github-actions",
@@ -328,10 +446,14 @@ class FeedbackLoop:
                     or reviewer.startswith("github-actions")):
                 continue
 
+            # Skip already-processed reviews
+            dedup_key = (pr_url, reviewer, body[:200])
+            if dedup_key in processed_keys:
+                continue
+
             sentiment = self._classify_sentiment(body)
 
             # Record in DB
-            conn = self.pool.get()
             conn.execute(
                 """INSERT INTO pr_reviews (pr_url, reviewer, review_type, body, sentiment)
                    VALUES (?, ?, ?, ?, ?)""",
@@ -356,17 +478,24 @@ class FeedbackLoop:
                 )
                 conn.commit()
 
-            # Mark notification as read
-            notif_id = notif.get("id")
-            if notif_id:
+            result_sentiment = sentiment
+
+        # Always mark notification as read — even if only bots commented
+        self._mark_notification_read(notif)
+
+        return result_sentiment
+
+    def _mark_notification_read(self, notif: dict):
+        """Mark a GitHub notification as read."""
+        notif_id = notif.get("id")
+        if notif_id:
+            try:
                 subprocess.run(
                     ["gh", "api", "-X", "PATCH", f"notifications/threads/{notif_id}"],
                     capture_output=True, text=True, timeout=10
                 )
-
-            return sentiment
-
-        return None
+            except Exception:
+                pass
 
     def _fetch_pr_reviews(self, pr_api_url: str) -> list:
         """Fetch reviews for a PR."""
@@ -404,19 +533,26 @@ class FeedbackLoop:
         if any(kw in text_lower for kw in ANTI_AI_KEYWORDS):
             return "hostile"  # anti-AI treated as hostile for action purposes
 
-        # CLA/DCO-related text is constructive (not contact_request)
+        # CLA/DCO-related text — needs Daniel's action (he must sign)
         cla_signals = {"cla", "contributor license agreement", "contributor agreement",
                        "generative ai agreement", "ai contribution agreement",
                        "sign the agreement", "signed-off-by", "dco"}
         if any(kw in text_lower for kw in cla_signals):
-            return "constructive"
+            return "cla_request"
 
         # Check for payment/job/contact requests (notify Daniel via Telegram)
-        if any(kw in text_lower for kw in PAYMENT_KEYWORDS):
+        # Guard: if text looks like code review feedback, skip contact/payment/job checks
+        _code_review_signals = {"commit", "format", "lint", "test", "fix", "refactor",
+                                "nit", "typo", "change", "update", "address",
+                                "suggestion", "review", "pr ", "pull request",
+                                "merge", "rebase", "squash", "ci ", "pipeline"}
+        is_code_review = sum(1 for s in _code_review_signals if s in text_lower) >= 2
+
+        if any(kw in text_lower for kw in PAYMENT_KEYWORDS) and not is_code_review:
             return "payment_request"
-        if any(kw in text_lower for kw in JOB_KEYWORDS):
+        if any(kw in text_lower for kw in JOB_KEYWORDS) and not is_code_review:
             return "job_inquiry"
-        if any(kw in text_lower for kw in CONTACT_KEYWORDS):
+        if any(kw in text_lower for kw in CONTACT_KEYWORDS) and not is_code_review:
             return "contact_request"
 
         # Check for sponsor mentions
@@ -479,46 +615,55 @@ class FeedbackLoop:
         # Detect reviewer's language for localized responses
         lang = _detect_language(body)
 
-        # --- ALWAYS notify Daniel for any human response ---
-        notify_github_attention(
-            sentiment, repo_full_name, html_url,
-            f"@{reviewer}: {body[:200]}"
+        # --- Only notify Daniel for actionable items (payment, CLA, contact, info requests) ---
+        _actionable_sentiments = {"payment_request", "job_inquiry", "contact_request", "cla_request", "sponsor"}
+        if sentiment in _actionable_sentiments:
+            notify_github_attention(
+                sentiment, repo_full_name, html_url,
+                f"@{reviewer}: {body[:200]}"
+            )
+
+        # --- Generate AI response (falls back to canned if AI fails) ---
+        ai_response = _generate_ai_response(
+            sentiment, body, reviewer, repo_full_name, pr_number
         )
 
         # --- Take automated action based on sentiment ---
         if sentiment == "payment_request":
-            self._comment_on_pr(
-                owner_repo, pr_number,
-                _get_translated("payment_reply", lang),
-            )
+            reply = ai_response or _get_translated("payment_reply", lang)
+            self._comment_on_pr(owner_repo, pr_number, reply)
             return "telegram_notified"
 
         if sentiment == "job_inquiry":
-            self._comment_on_pr(
-                owner_repo, pr_number,
-                _get_translated("job_reply", lang),
-            )
+            reply = ai_response or _get_translated("job_reply", lang)
+            self._comment_on_pr(owner_repo, pr_number, reply)
             return "telegram_notified"
 
         if sentiment == "contact_request":
-            self._comment_on_pr(
-                owner_repo, pr_number,
-                _get_translated("contact_reply", lang),
-            )
+            reply = ai_response or _get_translated("contact_reply", lang)
+            self._comment_on_pr(owner_repo, pr_number, reply)
             return "telegram_notified"
 
         if sentiment == "sponsor":
             self._react_to_comment(owner_repo, comment_id, "+1")
-            add_sponsor(conn, reviewer, repo_full_name, "comment",
+            add_sponsor(conn, reviewer, repo_full_name, "donation",
                         json.dumps({"quote": body[:500]}))
-            self._comment_on_pr(owner_repo, pr_number,
-                                _get_translated("sponsor_thanks", lang))
+            reply = ai_response or _get_translated("sponsor_thanks", lang)
+            self._comment_on_pr(owner_repo, pr_number, reply)
+            # Notify Daniel — donor repos get opus priority
+            notify_plain(
+                f"\U0001f4b0 DONOR DETECTED\n"
+                f"User: @{reviewer}\n"
+                f"Repo: {repo_full_name}\n"
+                f"Quote: {body[:200]}\n\n"
+                f"This repo is now opus-priority!"
+            )
             return "thanked"
 
         if sentiment == "positive":
             self._react_to_comment(owner_repo, comment_id, "+1")
-            self._comment_on_pr(owner_repo, pr_number,
-                                _get_translated("thank_review", lang))
+            reply = ai_response or _get_translated("thank_review", lang)
+            self._comment_on_pr(owner_repo, pr_number, reply)
             return "thanked"
 
         elif sentiment == "constructive":
@@ -547,6 +692,10 @@ class FeedbackLoop:
                 else:
                     action_note = "No matching contribution found — manual review needed"
 
+            # Post AI-generated acknowledgment
+            if ai_response:
+                self._comment_on_pr(owner_repo, pr_number, ai_response)
+
             # Log for tracking
             self.log_writer.append_entry(
                 f"## {datetime.now().strftime('%Y-%m-%d %H:%M')} — REVIEW RECEIVED\n"
@@ -568,9 +717,9 @@ class FeedbackLoop:
             body_lower = body.lower()
             is_anti_ai = any(kw in body_lower for kw in ANTI_AI_KEYWORDS)
 
-            # Polite exit in reviewer's language
-            self._comment_on_pr(owner_repo, pr_number,
-                                _get_translated("polite_exit", lang))
+            # AI-generated gracious exit
+            reply = ai_response or _get_translated("polite_exit", lang)
+            self._comment_on_pr(owner_repo, pr_number, reply)
 
             # Close PR
             self._close_pr(owner_repo, pr_number)
@@ -596,7 +745,8 @@ class FeedbackLoop:
             # Un-blacklist and re-engage
             if is_blacklisted(conn, repo_full_name):
                 remove_from_blacklist(conn, repo_full_name)
-                self._comment_on_pr(owner_repo, pr_number, COMPASSION_REENGAGEMENT)
+                reply = ai_response or COMPASSION_REENGAGEMENT
+                self._comment_on_pr(owner_repo, pr_number, reply)
 
                 self.log_writer.append_entry(
                     f"## {datetime.now().strftime('%Y-%m-%d %H:%M')} — RE-ENGAGED\n"

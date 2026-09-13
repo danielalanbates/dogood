@@ -204,6 +204,7 @@ def solve(
         # Distinguish skips from real failures (exit code 2 = skipped)
         is_skip = any(kw in error.lower() for kw in [
             "unsupported language", "duplicate pr", "anti-ai", "requires cla",
+            "quality gate", "blocked org", "blocked_quality_gate",
         ])
         if is_skip:
             console.print(f"[yellow]Skipped: {error}[/yellow]")
@@ -541,11 +542,11 @@ def stats():
 @app.command()
 def factory(
     max_issues: int = typer.Option(100, help="Max issues to solve"),
-    max_concurrent: int = typer.Option(5, help="Max parallel agents"),
+    max_concurrent: int = typer.Option(1, help="Always 1 (inline mode, no subprocesses)"),
     min_stars: int = typer.Option(1000, help="Minimum repo stars"),
     max_cost_usd: float = typer.Option(0.0, help="Max total cost in USD (0=unlimited)"),
 ):
-    """Run the multi-agent factory: spawns parallel agents to solve issues."""
+    """Run the factory: solves issues one at a time, inline (no subprocesses)."""
     import signal
     from src.orchestrator import AgentFactory
 
@@ -570,9 +571,19 @@ def factory(
     import atexit
     atexit.register(_cleanup_pid)
 
-    console.print(f"[bold]Starting Agent Factory[/bold]")
+    # Force single-agent mode regardless of what's passed
+    max_concurrent = 1
+
+    # Strip Claude Code env vars ONCE at startup to prevent "nested session"
+    # detection when the SDK spawns claude CLI subprocesses. This is safe to do
+    # once here rather than repeatedly inside solver._run_claude_fix().
+    for _k in list(os.environ):
+        if "CLAUDE" in _k.upper():
+            os.environ.pop(_k, None)
+
+    console.print(f"[bold]Starting Agent Factory (inline mode — no subprocesses)[/bold]")
     console.print(f"  Max issues:     {max_issues}")
-    console.print(f"  Max concurrent: {max_concurrent}")
+    console.print(f"  Mode:           1 issue at a time (inline)")
     console.print(f"  Min stars:      {min_stars}")
     if max_cost_usd:
         console.print(f"  Budget:         ${max_cost_usd:.2f}")
@@ -580,7 +591,21 @@ def factory(
 
     agent_factory = AgentFactory(max_concurrent=max_concurrent, min_stars=min_stars,
                                  max_cost_usd=max_cost_usd)
-    stats = asyncio.run(agent_factory.run(max_issues=max_issues))
+    try:
+        stats = asyncio.run(agent_factory.run(max_issues=max_issues))
+    except Exception as e:
+        # Catch FactoryHaltedError (and any other fatal error) from the async loop
+        from src.orchestrator import FactoryHaltedError
+        if isinstance(e, FactoryHaltedError) or (hasattr(e, '__cause__') and isinstance(e.__cause__, FactoryHaltedError)):
+            console.print(f"\n[bold red]Factory halted:[/bold red] {e}")
+        else:
+            console.print(f"\n[bold red]Factory crashed:[/bold red] {e}")
+        stats = agent_factory._stats
+        console.print(f"  Started:   {stats['started']}")
+        console.print(f"  Succeeded: [green]{stats['succeeded']}[/green]")
+        console.print(f"  Failed:    [red]{stats['failed']}[/red]")
+        console.print(f"  Error breakdown: {agent_factory._error_class_counts}")
+        raise typer.Exit(1)
 
     console.print(f"\n[bold green]Factory complete![/bold green]")
     console.print(f"  Started:   {stats['started']}")
@@ -741,7 +766,7 @@ def bountywatch(
                          "-f", "sort=created",
                          "-f", "order=desc",
                          "-f", "per_page=10",
-                         "--jq", '.items[] | {url: .html_url, title: .title, number: .number, repo: .repository_url, labels: [.labels[].name], created: .created_at, body: .body}'],
+                         "--jq", '.items[] | {url: .html_url, title: .title, number: .number, repo: .repository_url, labels: [.labels[].name], created: .created_at, body: (.body[:2000] // "")}'],
                         capture_output=True, text=True, timeout=15
                     )
                     if r.returncode == 0 and r.stdout.strip():
@@ -800,12 +825,9 @@ def bountywatch(
                     else:
                         print(f"    No competing PRs — we're first!", flush=True)
 
-                    # Notify Daniel
+                    # Bounty found logged locally (CEO only wants payment/CLA/info-request alerts)
                     comp_note = f"\n{len(competing_prs)} competing PRs" if competing_prs else "\nNo competition yet"
-                    notify_github_attention(
-                        "bounty_found", full_name, item["url"],
-                        f"#{item['number']}: {item['title'][:100]}\nLabels: {', '.join(item.get('labels', []))}{comp_note}"
-                    )
+                    print(f"    Bounty: #{item['number']}: {item['title'][:100]}{comp_note}", flush=True)
 
                     # Upsert repo and issue into DB
                     _upsert_bounty_repo_issue(conn, full_name, item, sp)
@@ -825,19 +847,12 @@ def bountywatch(
                         print(f"    Skipped (issue not in DB)", flush=True)
                         continue
 
-                    # Select model tier based on complexity (same as factory)
-                    from src.model_selector import score_complexity, select_tier
+                    # Bounties always use top tier (opus) for best quality
+                    from src.config import load_model_tiers
                     from src.solver import Solver
-                    repo_dict = {"language": repo_row["language"], "stars": repo_row["stars"], "open_issues": 0}
-                    issue_dict = {
-                        "title": item.get("title", ""),
-                        "body": item.get("body", ""),
-                        "labels": json.dumps(item.get("labels", [])),
-                        "comments_count": 0,
-                    }
-                    complexity = score_complexity(issue_dict, repo_dict)
-                    model_tier = select_tier(complexity, issue_row["id"], conn)
-                    print(f"    Bounty Agent: complexity {complexity:.3f} → {model_tier['label']} (50 turns)", flush=True)
+                    tiers = load_model_tiers()
+                    model_tier = tiers[-1].copy()  # opus-high
+                    print(f"    Bounty Agent: using {model_tier['label']} (50 turns)", flush=True)
 
                     solver = Solver(model_tier=model_tier, is_bounty=True)
 
@@ -854,10 +869,8 @@ def bountywatch(
                         result = asyncio.run(solver.solve_issue(issue_row["id"]))
                         if result["success"]:
                             print(f"    PR created: {result['pr_url']}", flush=True)
-                            notify_github_attention(
-                                "pr_merged", full_name, result["pr_url"],
-                                f"Bounty PR submitted for #{item['number']}: {item['title'][:80]}"
-                            )
+                            # Bounty PR logged locally (CEO only wants payment/CLA/info-request alerts)
+                            print(f"    Bounty PR: {result['pr_url']}", flush=True)
                         else:
                             print(f"    Failed: {result.get('error', '')[:80]}", flush=True)
                     except Exception as e:
@@ -979,7 +992,7 @@ def _upsert_bounty_repo_issue(conn, full_name: str, item: dict, sp):
         "repo_id": repo_row["id"],
         "number": item["number"],
         "title": item["title"],
-        "body": item.get("body", "") or "",
+        "body": (item.get("body", "") or "")[:10000],
         "state": "open",
         "labels": _json.dumps(item.get("labels", [])),
         "comments_count": 0,
