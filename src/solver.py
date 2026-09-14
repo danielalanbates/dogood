@@ -52,6 +52,10 @@ README_FILES = [
 ]
 
 
+class _SkipClaudeSDK(Exception):
+    """Solver ran on a non-Claude agent; go straight to the change check."""
+
+
 class Solver:
     def __init__(self, token: str = GITHUB_TOKEN, username: str = GITHUB_USERNAME,
                  agent_id: str = "main", work_dir: Path = WORK_DIR,
@@ -1048,6 +1052,11 @@ CRITICAL guidelines:
         cost_usd = 0.0
 
         try:
+            from src.llm import provider, run_agent_in
+            if self.model_tier and provider(self.model_tier["model"]) == "agy":
+                print(f"  Solver: Antigravity {self.model_tier['model'][4:]}", flush=True)
+                result_text = run_agent_in(clone_path, prompt, system_prompt)
+                raise _SkipClaudeSDK()
             from src.rate_coordinator import (
                 report_rate_limit, get_retry_delay, get_slot_for_agent,
             )
@@ -1154,6 +1163,14 @@ CRITICAL guidelines:
 
                     raise  # Re-raise non-retryable errors or last attempt
 
+        except _SkipClaudeSDK:
+            pass
+        except Exception as e:
+            import traceback
+            print(f"  Solver error: {e}\n{traceback.format_exc()}", flush=True)
+            return {"success": False, "error": str(e)}
+
+        try:
             # Check if there are actual changes
             diff_result = subprocess.run(
                 ["git", "-C", str(clone_path), "diff", "--stat", "HEAD~1"],
@@ -1258,7 +1275,6 @@ CRITICAL guidelines:
 
         Any failure (model limit, unparseable output) scores 0 so nothing is posted.
         """
-        from src.config import reviewer_model
         diff = subprocess.run(
             ["git", "-C", str(clone_path), "diff", "origin/HEAD...HEAD"],
             capture_output=True, text=True, timeout=30,
@@ -1282,13 +1298,9 @@ CRITICAL guidelines:
             "Be conservative. Reply with ONLY JSON: "
             '{"confidence": <integer 0-100>, "reason": "<one sentence>"}'
         )
-        env = {k: v for k, v in os.environ.items() if "CLAUDE" not in k.upper()}
+        from src.llm import complete
         try:
-            r = subprocess.run(
-                ["claude", "-p", prompt, "--model", reviewer_model(), "--output-format", "text"],
-                capture_output=True, text=True, timeout=600, env=env,
-            )
-            out = (r.stdout or "") + (r.stderr or "")
+            out = complete("reviewer", prompt, timeout=600)
             m = re.search(r'\{[^{}]*"confidence"[^{}]*\}', out)
             if not m:
                 return 0.0, f"review unparseable: {out.strip()[:200]}"

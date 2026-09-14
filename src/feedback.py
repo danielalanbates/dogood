@@ -1,6 +1,5 @@
 """Feedback loop: polls GitHub notifications, analyzes sentiment, takes action."""
 
-from src.config import primary_model
 import asyncio
 import json
 import subprocess
@@ -89,14 +88,8 @@ def _generate_ai_response(sentiment: str, reviewer_comment: str, reviewer: str,
     )
 
     try:
-        result = subprocess.run(
-            ["claude", "-p", prompt, "--model", primary_model(),
-             "--effort", "low",
-             "--max-turns", "1", "--output-format", "text"],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
+        from src.llm import complete
+        return complete("replies", prompt, timeout=60)
     except Exception as e:
         print(f"  AI response generation failed: {e}", flush=True)
 

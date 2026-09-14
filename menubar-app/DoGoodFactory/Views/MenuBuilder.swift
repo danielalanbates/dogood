@@ -420,8 +420,9 @@ class MenuBuilder {
         let modelsHeader = NSMenuItem(title: "AI Models", action: nil, keyEquivalent: "")
         modelsHeader.isEnabled = false
         menu.addItem(modelsHeader)
-        menu.addItem(FactoryModelMenuTarget.shared.menuItem(title: "Solver", role: "primary"))
-        menu.addItem(FactoryModelMenuTarget.shared.menuItem(title: "95% Reviewer", role: "reviewer"))
+        for role in FactoryModelChoice.roles {
+            menu.addItem(FactoryModelMenuTarget.shared.menuItem(title: role.title, role: role.key))
+        }
 
         // ── Options ──
         menu.addItem(NSMenuItem.separator())
@@ -439,11 +440,6 @@ class MenuBuilder {
         menu.addItem(optionsHeader)
 
         if let delegate = delegate {
-            let modelView = ModelSelectorView(delegate: delegate)
-            let modelItem = NSMenuItem()
-            modelItem.view = modelView
-            menu.addItem(modelItem)
-
             let helperTypeView = HelperTypeSelectorView(delegate: delegate)
             let helperTypeItem = NSMenuItem()
             helperTypeItem.view = helperTypeView

@@ -59,9 +59,17 @@ def request(kind: str, summary: str, commands: list[list[str]], meta: dict | Non
         })
         _write(entries)
     if ask:
-        from src.telegram import notify_plain
-        notify_plain(f"🤝 Do Good wants to post (#{entry_id}, {kind}):\n{summary}\n\n"
-                     f"Reply \"yes {entry_id}\" to post or \"no {entry_id}\" to discard.")
+        from src.telegram import send_message
+        message_id = send_message(
+            f"🤝 Do Good wants to post (#{entry_id}, {kind}):\n{summary}\n\n"
+            f"Reply yes or no (or just 👍 / 👎).")
+        if message_id:
+            with _locked():
+                entries = _read()
+                for e in entries:
+                    if e["id"] == entry_id:
+                        e["meta"]["telegram_message_id"] = message_id
+                _write(entries)
     return entry_id
 
 

@@ -93,12 +93,15 @@ def notify(message: str) -> bool:
 
 def notify_plain(message: str) -> bool:
     """Send a plain-text Telegram message (no Markdown parsing issues)."""
-    data = {
-        "chat_id": CHAT_ID,
-        "text": message
-    }
-    resp = _make_request(API_URL, data)
-    return resp.get("ok", False)
+    return send_message(message) is not None
+
+
+def send_message(message: str) -> int | None:
+    """Send plain text; returns Telegram's message_id so reactions can be matched later."""
+    resp = _make_request(API_URL, {"chat_id": CHAT_ID, "text": message})
+    if resp.get("ok"):
+        return resp.get("result", {}).get("message_id")
+    return None
 
 
 def notify_github_attention(event_type: str, repo: str, url: str, summary: str):
@@ -129,7 +132,7 @@ def get_updates(offset: int = 0, timeout: int = 30) -> list:
     data = {
         "offset": offset,
         "timeout": timeout,
-        "allowed_updates": ["message"]
+        "allowed_updates": ["message", "message_reaction"]
     }
     resp = _make_request(url, data, timeout=timeout + 10)
     return resp.get("result", [])
@@ -150,6 +153,7 @@ class TelegramDaemon:
         self.recent_notifications = deque(maxlen=20)
         # Conversation history — passed to Claude each call so it has memory
         self.conversation = deque(maxlen=20)
+        self.sent_messages: dict[int, str] = {}
 
     def run(self, poll_interval: int = 5):
         """Run the Telegram daemon — long-polls for messages."""
@@ -164,19 +168,7 @@ class TelegramDaemon:
                 updates = get_updates(offset=self.offset, timeout=5)
                 for update in updates:
                     self.offset = update["update_id"] + 1
-                    msg = update.get("message", {})
-                    chat_id = str(msg.get("chat", {}).get("id", ""))
-
-                    # Only process messages from Daniel
-                    if chat_id != CHAT_ID:
-                        continue
-
-                    text = msg.get("text", "").strip()
-                    if not text:
-                        continue
-
-                    reply_to = msg.get("reply_to_message", {})
-                    self._handle_message(text, reply_to)
+                    self._handle_update(update)
 
                 # Poll outbox for responses from Claude Code session
                 self._poll_outbox()
@@ -227,19 +219,60 @@ class TelegramDaemon:
             "yes <n> / no <n> — post or discard request n\n"
             "Anything else, just ask.")
 
+    def _handle_update(self, update: dict):
+        """Turn any message, sticker, photo caption, or reaction into text for Gemini."""
+        reaction = update.get("message_reaction")
+        if reaction:
+            if str(reaction.get("chat", {}).get("id", "")) != CHAT_ID:
+                return
+            emojis = [r.get("emoji", "") for r in reaction.get("new_reaction", []) if r.get("type") == "emoji"]
+            if not emojis:
+                return
+            reacted = self._find_message(reaction.get("message_id"))
+            self._handle_message(f"(Daniel reacted {''.join(emojis)} to your message)",
+                                 {"text": reacted} if reacted else {})
+            return
+
+        msg = update.get("message", {})
+        if str(msg.get("chat", {}).get("id", "")) != CHAT_ID:
+            return
+        text = (msg.get("text") or msg.get("caption") or "").strip()
+        if not text and msg.get("sticker"):
+            text = f"(sticker {msg['sticker'].get('emoji', '')})"
+        if not text:
+            kinds = [k for k in ("photo", "voice", "video", "document", "audio") if k in msg]
+            if not kinds:
+                return
+            text = f"(Daniel sent a {kinds[0]} with no text)"
+        self._handle_message(text, msg.get("reply_to_message", {}))
+
+    def _find_message(self, message_id: int | None) -> str:
+        """Text of a message we sent, so a reaction can be understood in context."""
+        if message_id is None:
+            return ""
+        if message_id in self.sent_messages:
+            return self.sent_messages[message_id]
+        from src import approvals
+        for e in approvals._read():
+            if e.get("meta", {}).get("telegram_message_id") == message_id:
+                return f"Do Good wants to post (#{e['id']}, {e['kind']}): {e['summary']}"
+        return ""
+
     def _handle_message(self, text: str, reply_to: dict):
         ts = datetime.now().strftime("%H:%M:%S")
         print(f"[{ts}] Daniel: {text[:200]}", flush=True)
-        self.conversation.append({"role": "user", "text": text[:500]})
-        reply = self._run_command(text, reply_to.get("text", "") if reply_to else "")
+        reply = self._ask_gemini(text, reply_to or {})
         if reply is None:
-            reply = self._ask_gemini(text, reply_to)
+            reply = self._run_command(text, (reply_to or {}).get("text", "")) or self.HELP
+        self.conversation.append({"role": "user", "text": text[:1000]})
         if not reply:
             return
         print(f"[{ts}] <- {reply[:120]}", flush=True)
-        self.conversation.append({"role": "assistant", "text": reply[:500]})
+        self.conversation.append({"role": "assistant", "text": reply[:1000]})
         for i in range(0, len(reply), 4000):
-            notify_plain(reply[i:i + 4000])
+            message_id = send_message(reply[i:i + 4000])
+            if message_id:
+                self.sent_messages[message_id] = reply[i:i + 4000][:1000]
 
     def _run_command(self, text: str, reply_text: str = "") -> str | None:
         """Deterministic commands — no AI tokens. Returns None if text isn't a command."""
@@ -316,48 +349,56 @@ class TelegramDaemon:
         lines.append(f"Models: solver {primary_model()}, reviewer {reviewer_model()}")
         return "\n".join(lines)
 
-    def _ask_gemini(self, text: str, reply_to: dict) -> str:
-        """Free-form chat runs on Gemini so it never spends Claude tokens."""
-        try:
-            secrets = json.loads((DAEMON_MANAGER_DIR / "secrets.json").read_text())
-            key = secrets.get("GEMINI_API_KEY") or secrets.get("GOOGLE_API_KEY")
-        except Exception:
-            key = os.environ.get("GEMINI_API_KEY")
-        if not key:
-            return "I couldn't find a Gemini API key. " + self.HELP
-
-        context = self._build_context(text, reply_to)
+    def _ask_gemini(self, text: str, reply_to: dict) -> str | None:
+        """Chat exactly like Gemini Flash, with Do Good controls. None means Gemini is unavailable."""
+        from src import approvals
+        waiting = approvals.pending()
+        waiting_text = "\n".join(f"#{e['id']} ({e['kind']}): {e['summary'][:400]}" for e in waiting) or "none"
+        reply_text = (reply_to or {}).get("text", "")
         system = (
-            "You are the Do Good Factory's Telegram assistant, talking to Daniel through his "
-            "Philanthropy bot. Do Good fixes open-source issues; every GitHub post waits for "
-            "Daniel's yes. Be brief, plain, and honest. Never use profanity.\n"
-            "If Daniel is clearly asking you to perform one of these actions, reply with ONLY "
-            "the line `CMD: <action>` where action is one of: status, start, stop, pending, "
-            "yes <n>, no <n>, help. Otherwise answer from the status below.\n\n"
-            f"CURRENT STATUS:\n{self._status_text()}\n\n{context}"
+            "You are Daniel's assistant, chatting with Daniel Bates on Telegram through his Philanthropy bot. "
+            "Talk exactly as you normally would as a general assistant: warm, natural, helpful on any topic, and brief "
+            "enough for a phone. Never use profanity.\n\n"
+            "You also run the Do Good Factory, which fixes open-source GitHub issues. Nothing is "
+            "posted to GitHub unless Daniel approves that specific request.\n"
+            "Read Daniel loosely, including emojis, stickers and reactions: 👍 ✅ 👌 🙌 🚀 💯 or "
+            "\"sure\"/\"do it\" usually mean yes; 👎 ❌ 🚫 🗑️ or \"nah\" usually mean no; "
+            "▶️ means start, ⏹️ ⏸️ 🛑 mean stop. Use the conversation to decide what an emoji refers to.\n"
+            "To act, put each action on its own line as `CMD: <action>`, where action is one of: "
+            "status, start, stop, pending, yes <n>, no <n>. You may add a short normal reply too. "
+            "Only approve or reject when it is clear which request Daniel means; if several are "
+            "waiting and it is unclear, ask. Don't take an action Daniel didn't ask for.\n\n"
+            f"FACTORY STATUS:\n{self._status_text()}\n\n"
+            f"REQUESTS WAITING FOR DANIEL:\n{waiting_text}\n"
+            + (f"\nDaniel is replying or reacting to this message:\n{reply_text[:1500]}\n" if reply_text else "")
         )
-        body = {
-            "system_instruction": {"parts": [{"text": system}]},
-            "contents": [{"role": "user", "parts": [{"text": text}]}],
-        }
-        model = os.environ.get("DOGOOD_CHAT_MODEL", "gemini-flash-latest")
+        contents = [
+            {"role": "user" if m["role"] == "user" else "model", "parts": [{"text": m["text"]}]}
+            for m in self.conversation
+        ]
+        contents.append({"role": "user", "parts": [{"text": text}]})
+        from src.llm import model_for, provider, gemini_generate, complete
+        model = model_for("chat")
         try:
-            req = urllib.request.Request(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                data=json.dumps(body).encode(),
-                headers={"Content-Type": "application/json", "x-goog-api-key": key},
-            )
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                data = json.load(resp)
-            answer = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            if provider(model) == "gemini":
+                answer = gemini_generate(model, contents, system)
+            else:
+                history = "\n".join(f"{'Daniel' if c['role'] == 'user' else 'You'}: {c['parts'][0]['text']}"
+                                     for c in contents)
+                answer = complete("chat", history, system=system, timeout=120)
         except Exception as e:
-            print(f"  [GEMINI] error: {e}", flush=True)
-            return "Gemini didn't answer just now. " + self.HELP
+            print(f"  [CHAT] {model} error: {e}", flush=True)
+            return None
 
-        m = re.match(r"^`?CMD:\s*(.+?)`?$", answer)
-        if m:
-            return self._run_command(m.group(1)) or self.HELP
-        return answer
+        results, lines = [], []
+        for line in answer.splitlines():
+            m = re.match(r"^\s*`?CMD:\s*(.+?)`?\s*$", line)
+            if m:
+                results.append(self._run_command(m.group(1)) or f"(couldn't do: {m.group(1)})")
+            else:
+                lines.append(line)
+        reply = "\n".join(lines).strip()
+        return "\n\n".join(x for x in [reply, *results] if x)
 
     def _poll_outbox(self):
         """Check outbox for responses from Claude Code session and send them."""
