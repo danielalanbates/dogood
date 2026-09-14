@@ -41,17 +41,37 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return .terminateNow
     }
 
+    private static func pipelineOk() -> Bool {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        task.arguments = ["list", "com.batesai.dogood.factory"]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = Pipe()
+        do { try task.run() } catch { return false }
+        task.waitUntilExit()
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        if task.terminationStatus != 0 || !out.contains("\"PID\"") { return false }
+        for log in ["/tmp/dogood-scout.log", "/tmp/dogood-factory.log"] {
+            guard let text = try? String(contentsOfFile: log, encoding: .utf8) else { continue }
+            let last = text.split(separator: "\n").suffix(3).joined(separator: "\n").lowercased()
+            if last.contains("traceback") || last.contains("cycle error") || last.contains("paused")
+                || last.contains("sleeping") { return false }
+        }
+        return true
+    }
+
     private func updateMenu(state: SystemState) {
         lastState = state
         let allHealthy = state.daemons.allSatisfy { $0.isHealthy || !$0.config.plistExists }
         let factoryOk = state.factoryHealth.map {
-            $0.status == .healthy || $0.status == .rateLimited || $0.status == .idle
+            $0.status == .healthy || $0.status == .idle
         } ?? true
 
-        if !allHealthy || !factoryOk {
+        // Red whenever anything isn't working: a daemon down, the factory paused
+        // on a limit, or Scout/Fixer's latest log line is an error.
+        if !allHealthy || !factoryOk || !Self.pipelineOk() {
             statusIcon.mode = .unhealthy
-        } else if state.factoryHealth?.status == .rateLimited {
-            statusIcon.mode = .paused
         } else {
             statusIcon.mode = .healthy
         }

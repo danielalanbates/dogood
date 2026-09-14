@@ -145,7 +145,7 @@ def extract_github_url(text: str) -> str | None:
 
 
 class TelegramDaemon:
-    """Polls the Philanthropy bot: commands run directly, chat goes to Gemini."""
+    """Polls the Philanthropy bot: commands run directly, chat goes to the chosen AI (Antigravity)."""
 
     def __init__(self):
         self.offset = 0
@@ -220,7 +220,7 @@ class TelegramDaemon:
             "Anything else, just ask.")
 
     def _handle_update(self, update: dict):
-        """Turn any message, sticker, photo caption, or reaction into text for Gemini."""
+        """Turn any message, sticker, photo caption, or reaction into text for the AI."""
         reaction = update.get("message_reaction")
         if reaction:
             if str(reaction.get("chat", {}).get("id", "")) != CHAT_ID:
@@ -261,7 +261,7 @@ class TelegramDaemon:
     def _handle_message(self, text: str, reply_to: dict):
         ts = datetime.now().strftime("%H:%M:%S")
         print(f"[{ts}] Daniel: {text[:200]}", flush=True)
-        reply = self._ask_gemini(text, reply_to or {})
+        reply = self._ask_ai(text, reply_to or {})
         if reply is None:
             reply = self._run_command(text, (reply_to or {}).get("text", "")) or "Sorry, my AI brain is offline for a moment. Simple things like \"status\", \"start\", \"stop\" or \"yes 3\" still work."
         self.conversation.append({"role": "user", "text": text[:1000]})
@@ -351,8 +351,8 @@ class TelegramDaemon:
         lines.append("(factory = the Fixer; scout finds and rates issues; the Fixer takes the best-rated first)")
         return "\n".join(lines)
 
-    def _ask_gemini(self, text: str, reply_to: dict) -> str | None:
-        """Chat exactly like Gemini Flash, with Do Good controls. None means Gemini is unavailable."""
+    def _ask_ai(self, text: str, reply_to: dict) -> str | None:
+        """Chat through the chosen Antigravity model, with Do Good controls. None means the AI is unavailable."""
         from src import approvals
         waiting = approvals.pending()
         waiting_text = "\n".join(f"#{e['id']} ({e['kind']}): {e['summary'][:400]}" for e in waiting) or "none"
@@ -405,7 +405,7 @@ class TelegramDaemon:
         reply = "\n".join(lines).strip()
         if not results:
             return reply
-        # Second pass: let Gemini tell Daniel what happened in plain conversation,
+        # Second pass: let the AI tell Daniel what happened in plain conversation,
         # instead of dumping raw command output.
         followup = contents + [
             {"role": "model", "parts": [{"text": answer}]},

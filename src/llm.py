@@ -21,11 +21,11 @@ AGY = str(Path.home() / ".local/bin/agy")
 
 # role -> (default model, whether the role must be able to edit files)
 ROLES = {
-    "scout": ("gemini-flash-latest", False),     # finds and rates issues
+    "scout": ("agy:gemini-3.8-flash-low", False),     # finds and rates issues
     "primary": ("agy:gemini-3.8-flash-high", True),       # fixer
     "reviewer": ("agy:gemini-3.1-pro-high", False),     # 95% acceptance review
-    "replies": ("gemini-flash-latest", False),   # replies to maintainers
-    "chat": ("gemini-flash-latest", False),      # Telegram conversation
+    "replies": ("agy:gemini-3.8-flash-low", False),   # replies to maintainers
+    "chat": ("agy:gemini-3.8-flash-low", False),      # Telegram conversation
 }
 
 

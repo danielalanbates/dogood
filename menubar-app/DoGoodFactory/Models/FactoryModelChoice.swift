@@ -9,11 +9,11 @@ enum FactoryModelChoice {
     struct Role { let key: String; let title: String; let defaultModel: String; let needsTools: Bool }
 
     static let roles: [Role] = [
-        Role(key: "scout", title: "Scout (finds issues)", defaultModel: "gemini-flash-latest", needsTools: false),
+        Role(key: "scout", title: "Scout (finds issues)", defaultModel: "agy:gemini-3.8-flash-low", needsTools: false),
         Role(key: "primary", title: "Fixer (fixes issues)", defaultModel: "agy:gemini-3.8-flash-high", needsTools: true),
         Role(key: "reviewer", title: "95% Reviewer", defaultModel: "agy:gemini-3.1-pro-high", needsTools: false),
-        Role(key: "replies", title: "Maintainer Replies", defaultModel: "gemini-flash-latest", needsTools: false),
-        Role(key: "chat", title: "Telegram Chat", defaultModel: "gemini-flash-latest", needsTools: false),
+        Role(key: "replies", title: "Maintainer Replies", defaultModel: "agy:gemini-3.8-flash-low", needsTools: false),
+        Role(key: "chat", title: "Telegram Chat", defaultModel: "agy:gemini-3.8-flash-low", needsTools: false),
     ]
 
     static let options: [Option] = [
@@ -21,8 +21,7 @@ enum FactoryModelChoice {
         Option(id: "claude-opus-5", label: "Opus 5", group: "Claude"),
         Option(id: "claude-sonnet-5", label: "Sonnet 5", group: "Claude"),
         Option(id: "claude-haiku-4-5-20251001", label: "Haiku 4.5", group: "Claude"),
-        Option(id: "gemini-flash-latest", label: "Gemini Flash", group: "Gemini API"),
-        Option(id: "gemini-pro-latest", label: "Gemini Pro", group: "Gemini API"),
+        Option(id: "agy:gemini-3.8-flash-low", label: "Gemini 3.8 Flash (Low)", group: "Antigravity"),
         Option(id: "agy:gemini-3.8-flash-high", label: "Gemini 3.8 Flash (High)", group: "Antigravity"),
         Option(id: "agy:gemini-3.1-pro-high", label: "Gemini 3.1 Pro (High)", group: "Antigravity"),
         Option(id: "agy:gpt-oss-120b-medium", label: "GPT-OSS 120B", group: "Antigravity"),
