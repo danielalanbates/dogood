@@ -21,8 +21,8 @@ AGY = str(Path.home() / ".local/bin/agy")
 
 # role -> (default model, whether the role must be able to edit files)
 ROLES = {
-    "primary": ("claude-fable-5-1", True),       # solver
-    "reviewer": ("claude-fable-5-1", False),     # 95% acceptance review
+    "primary": ("agy:gemini-3.8-flash-high", True),       # solver
+    "reviewer": ("agy:gemini-3.1-pro-high", False),     # 95% acceptance review
     "replies": ("gemini-flash-latest", False),   # replies to maintainers
     "chat": ("gemini-flash-latest", False),      # Telegram conversation
 }
@@ -69,7 +69,7 @@ def gemini_generate(model: str, contents: list[dict], system: str = "", timeout:
         body["system_instruction"] = {"parts": [{"text": system}]}
     import time
     last_error = None
-    for attempt, name in enumerate([model, model, "gemini-2.5-flash"]):
+    for attempt, name in enumerate([model, "gemini-flash-lite-latest", "gemini-2.5-flash-lite"]):
         req = urllib.request.Request(
             f"https://generativelanguage.googleapis.com/v1beta/models/{name}:generateContent",
             data=json.dumps(body).encode(),
@@ -83,7 +83,15 @@ def gemini_generate(model: str, contents: list[dict], system: str = "", timeout:
             last_error = e
             if e.code not in (429, 500, 503):
                 raise
-            time.sleep(2 * (attempt + 1))
+            time.sleep(1 + attempt)
+    # API quota gone: Antigravity has its own OAuth quota.
+    history = "\n\n".join(f"{'Daniel' if c.get('role') != 'model' else 'You'}: {c['parts'][0]['text']}" for c in contents)
+    full = f"{system}\n\n{history}" if system else history
+    r = subprocess.run([AGY, "-p", full, "--model", "gemini-3.8-flash-low", "--output-format", "text",
+                        "--print-timeout", f"{timeout}s"], capture_output=True, text=True,
+                       timeout=timeout + 30, env=_clean_env(), cwd="/tmp")
+    if r.returncode == 0 and r.stdout.strip():
+        return r.stdout.strip()
     raise last_error
 
 

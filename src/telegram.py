@@ -263,7 +263,7 @@ class TelegramDaemon:
         print(f"[{ts}] Daniel: {text[:200]}", flush=True)
         reply = self._ask_gemini(text, reply_to or {})
         if reply is None:
-            reply = self._run_command(text, (reply_to or {}).get("text", "")) or self.HELP
+            reply = self._run_command(text, (reply_to or {}).get("text", "")) or "Sorry, my AI brain is offline for a moment. Simple things like \"status\", \"start\", \"stop\" or \"yes 3\" still work."
         self.conversation.append({"role": "user", "text": text[:1000]})
         if not reply:
             return
@@ -367,7 +367,10 @@ class TelegramDaemon:
             "To act, put each action on its own line as `CMD: <action>`, where action is one of: "
             "status, start, stop, pending, yes <n>, no <n>. You may add a short normal reply too. "
             "Only approve or reject when it is clear which request Daniel means; if several are "
-            "waiting and it is unclear, ask. Don't take an action Daniel didn't ask for.\n\n"
+            "waiting and it is unclear, ask. Don't take an action Daniel didn't ask for.\n"
+            "Interpret intent, not keywords: \"how's it going\", \"anything new?\", \"what's up with the factory\" "
+            "mean status; \"fire it up\", \"get to work\" mean start; \"take a break\", \"shut it down\" mean stop. "
+            "Never reply with a command menu or list of keywords; just talk. Don't use markdown headers.\n\n"
             f"FACTORY STATUS:\n{self._status_text()}\n\n"
             f"REQUESTS WAITING FOR DANIEL:\n{waiting_text}\n"
             + (f"\nDaniel is replying or reacting to this message:\n{reply_text[:1500]}\n" if reply_text else "")
@@ -398,7 +401,27 @@ class TelegramDaemon:
             else:
                 lines.append(line)
         reply = "\n".join(lines).strip()
-        return "\n\n".join(x for x in [reply, *results] if x)
+        if not results:
+            return reply
+        # Second pass: let Gemini tell Daniel what happened in plain conversation,
+        # instead of dumping raw command output.
+        followup = contents + [
+            {"role": "model", "parts": [{"text": answer}]},
+            {"role": "user", "parts": [{"text": "(system) The actions ran. Results:\n" + "\n---\n".join(results)
+             + "\nNow reply to Daniel conversationally, like a friend giving a quick update. Summarize what matters "
+               "in plain words (no raw labels like 'factory: on', no command lists, no CMD lines). "
+               "If a request is waiting, say what it is and that he can just say yes or no."}]},
+        ]
+        try:
+            if provider(model) == "gemini":
+                spoken = gemini_generate(model, followup, system)
+            else:
+                spoken = complete("chat", followup[-1]["parts"][0]["text"], system=system, timeout=120)
+            spoken = "\n".join(l for l in spoken.splitlines() if not re.match(r"^\s*`?CMD:", l)).strip()
+            return spoken or "\n\n".join(results)
+        except Exception as e:
+            print(f"  [CHAT] followup error: {e}", flush=True)
+            return "\n\n".join(x for x in [reply, *results] if x)
 
     def _poll_outbox(self):
         """Check outbox for responses from Claude Code session and send them."""

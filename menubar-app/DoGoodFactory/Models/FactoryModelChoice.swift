@@ -9,8 +9,8 @@ enum FactoryModelChoice {
     struct Role { let key: String; let title: String; let defaultModel: String; let needsTools: Bool }
 
     static let roles: [Role] = [
-        Role(key: "primary", title: "Solver", defaultModel: "claude-fable-5-1", needsTools: true),
-        Role(key: "reviewer", title: "95% Reviewer", defaultModel: "claude-fable-5-1", needsTools: false),
+        Role(key: "primary", title: "Solver", defaultModel: "agy:gemini-3.8-flash-high", needsTools: true),
+        Role(key: "reviewer", title: "95% Reviewer", defaultModel: "agy:gemini-3.1-pro-high", needsTools: false),
         Role(key: "replies", title: "Maintainer Replies", defaultModel: "gemini-flash-latest", needsTools: false),
         Role(key: "chat", title: "Telegram Chat", defaultModel: "gemini-flash-latest", needsTools: false),
     ]

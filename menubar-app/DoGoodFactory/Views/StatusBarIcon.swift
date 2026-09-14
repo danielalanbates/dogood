@@ -95,8 +95,11 @@ class StatusBarIcon: NSView {
         let clip = NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius)
         clip.addClip()
 
+        // Running: whole icon light green, with a brighter column sweeping across.
+        NSColor(calibratedRed: 0.56, green: 0.93, blue: 0.56, alpha: 1).setFill()
+        NSBezierPath(rect: rect).fill()
         let columnRect = NSRect(x: x, y: rect.origin.y, width: columnWidth, height: rect.height)
-        NSColor.systemGreen.setFill()
+        NSColor.white.withAlphaComponent(0.7).setFill()
         NSBezierPath(rect: columnRect).fill()
 
         NSGraphicsContext.restoreGraphicsState()
