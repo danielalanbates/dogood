@@ -401,9 +401,15 @@ class Solver:
                     clone_path, owner, repo_name, issue, issue_context, guidelines
                 )
                 submit = confidence >= AUTO_SUBMIT_MIN_CONFIDENCE
+                self._approval_context = {
+                    "contribution_id": contrib_id,
+                    "confidence": confidence,
+                    "review": review_notes,
+                    "propose": submit,
+                }
                 print(f"  Acceptance review: {confidence:.0%} "
-                      f"(submit threshold {AUTO_SUBMIT_MIN_CONFIDENCE:.0%}) — "
-                      f"{'SUBMITTING' if submit else 'queued, not posted'}")
+                      f"(threshold {AUTO_SUBMIT_MIN_CONFIDENCE:.0%}) — "
+                      f"{'asking Daniel via Telegram' if submit else 'below threshold, not proposed'}")
                 if review_notes:
                     print(f"    {review_notes[:400]}")
 
@@ -411,7 +417,6 @@ class Solver:
                 pr_url = self._push_and_pr(
                     clone_path, owner, repo_name,
                     issue_number, issue["title"], branch_name, guidelines,
-                    auto_submit=submit,
                 )
                 if pr_url == "PENDING_APPROVAL":
                     update_contribution_status(conn, contrib_id, "pending_approval")
@@ -1253,7 +1258,7 @@ CRITICAL guidelines:
 
         Any failure (model limit, unparseable output) scores 0 so nothing is posted.
         """
-        from src.config import PRIMARY_MODEL
+        from src.config import reviewer_model
         diff = subprocess.run(
             ["git", "-C", str(clone_path), "diff", "origin/HEAD...HEAD"],
             capture_output=True, text=True, timeout=30,
@@ -1280,7 +1285,7 @@ CRITICAL guidelines:
         env = {k: v for k, v in os.environ.items() if "CLAUDE" not in k.upper()}
         try:
             r = subprocess.run(
-                ["claude", "-p", prompt, "--model", PRIMARY_MODEL, "--output-format", "text"],
+                ["claude", "-p", prompt, "--model", reviewer_model(), "--output-format", "text"],
                 capture_output=True, text=True, timeout=600, env=env,
             )
             out = (r.stdout or "") + (r.stderr or "")
@@ -1295,13 +1300,12 @@ CRITICAL guidelines:
     def _push_and_pr(
         self, clone_path: Path, upstream_owner: str, repo: str,
         issue_number: int, issue_title: str, branch_name: str,
-        guidelines: dict | None = None, auto_submit: bool = False,
+        guidelines: dict | None = None,
     ) -> str:
-        """Push the branch and create a PR, respecting project conventions."""
+        """Prepare the PR; it is queued for Daniel's Telegram approval, never posted directly."""
         guidelines = guidelines or {}
 
-        from src.config import REQUIRE_HUMAN_APPROVAL as _require_approval
-        REQUIRE_HUMAN_APPROVAL = _require_approval and not auto_submit
+        REQUIRE_HUMAN_APPROVAL = True
 
         if not REQUIRE_HUMAN_APPROVAL:
             subprocess.run(
@@ -1429,6 +1433,23 @@ CRITICAL guidelines:
         PENDING_PR_QUEUE.parent.mkdir(parents=True, exist_ok=True)
         with open(PENDING_PR_QUEUE, "a") as f:
             f.write(json.dumps(entry) + "\n")
+
+        from src import approvals
+        ctx = getattr(self, "_approval_context", None) or {}
+        confidence = ctx.get("confidence")
+        summary = (
+            f"PR to {upstream_owner}/{repo} for issue #{issue_number}\n"
+            f"{pr_title}\n"
+            f"https://github.com/{upstream_owner}/{repo}/issues/{issue_number}\n"
+            + (f"Reviewer confidence: {confidence:.0%} — {ctx.get('review', '')[:300]}" if confidence is not None else "")
+        )
+        approvals.request(
+            "pull request", summary, [entry["push_cmd"], entry["pr_create_cmd"]],
+            meta={"contribution_id": ctx.get("contribution_id"), "repo": entry["repo"],
+                  "issue_number": issue_number, "confidence": confidence},
+            ask=bool(ctx.get("propose")),
+        )
+        self._approval_context = None
         print(f"  [APPROVAL GATE] PR NOT posted. Queued for human approval: "
               f"{upstream_owner}/{repo}#{issue_number} branch={branch_name} "
               f"-> {PENDING_PR_QUEUE}", flush=True)
@@ -1529,12 +1550,7 @@ CRITICAL guidelines:
             )
 
             if result["success"]:
-                # Push updates to the same branch (auto-updates the PR)
-                print("  Pushing updates...")
-                subprocess.run(
-                    ["git", "-C", str(clone_path), "push", "origin", branch_name],
-                    check=True, capture_output=True, text=True, timeout=60
-                )
+                push_cmd = ["git", "-C", str(clone_path), "push", "origin", branch_name]
 
                 # Thank the reviewer in their language
                 from src.feedback import _detect_language
@@ -1551,11 +1567,15 @@ CRITICAL guidelines:
                     "fr": f"Merci pour le retour, @{feedback_reviewer} ! J'ai poussé une mise à jour avec les modifications demandées. N'hésitez pas à revérifier.",
                 }
                 thank_msg = _thank_translations.get(reviewer_lang, _thank_translations["en"])
-                subprocess.run(
-                    ["gh", "pr", "comment", pr_number,
-                     "--repo", f"{owner}/{repo_name}", "--body", thank_msg],
-                    capture_output=True, text=True, timeout=15
+                from src import approvals
+                approvals.request(
+                    "review revision",
+                    f"Push fixes for @{feedback_reviewer}'s review on {pr_url} and reply:\n\"{thank_msg}\"",
+                    [push_cmd, ["gh", "pr", "comment", pr_number,
+                                "--repo", f"{owner}/{repo_name}", "--body", thank_msg]],
+                    meta={"contribution_id": contribution_id, "pr_url": pr_url},
                 )
+                print("  Revision ready — queued for Daniel's approval", flush=True)
 
                 update_feedback_status(conn, contribution_id, "addressed")
                 return {"success": True, "pr_url": pr_url}

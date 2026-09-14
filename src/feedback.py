@@ -1,5 +1,6 @@
 """Feedback loop: polls GitHub notifications, analyzes sentiment, takes action."""
 
+from src.config import primary_model
 import asyncio
 import json
 import subprocess
@@ -89,7 +90,7 @@ def _generate_ai_response(sentiment: str, reviewer_comment: str, reviewer: str,
 
     try:
         result = subprocess.run(
-            ["claude", "-p", prompt, "--model", "claude-fable-5-1",
+            ["claude", "-p", prompt, "--model", primary_model(),
              "--effort", "low",
              "--max-turns", "1", "--output-format", "text"],
             capture_output=True, text=True, timeout=30,
@@ -587,7 +588,9 @@ class FeedbackLoop:
         return pr_api_url.replace("https://api.github.com/repos/", "https://github.com/").replace("/pulls/", "/pull/")
 
     def _react_to_comment(self, owner_repo: str, comment_id: int, reaction: str = "+1"):
-        """Add a reaction (thumbs up etc.) to a comment. Delays 10s to look human."""
+        """Reactions are no longer posted: every GitHub post needs Daniel's approval,
+        and asking about emoji reactions would be noise."""
+        return
         if not comment_id:
             return
         time.sleep(10)
@@ -761,26 +764,22 @@ class FeedbackLoop:
         return None
 
     def _comment_on_pr(self, owner_repo: str, pr_number: str, comment: str):
-        """Post a comment on a PR. Delays 60s to look human."""
-        time.sleep(60)
-        try:
-            subprocess.run(
-                ["gh", "pr", "comment", pr_number,
-                 "--repo", owner_repo, "--body", comment],
-                capture_output=True, text=True, timeout=15
-            )
-        except Exception as e:
-            print(f"  Failed to comment on PR: {e}")
+        """Queue a PR comment for Daniel's approval."""
+        from src import approvals
+        approvals.request(
+            "comment",
+            f"Comment on https://github.com/{owner_repo}/pull/{pr_number}:\n\"{comment[:800]}\"",
+            [["gh", "pr", "comment", pr_number, "--repo", owner_repo, "--body", comment]],
+        )
 
     def _close_pr(self, owner_repo: str, pr_number: str):
-        """Close a PR."""
-        try:
-            subprocess.run(
-                ["gh", "pr", "close", pr_number, "--repo", owner_repo],
-                capture_output=True, text=True, timeout=15
-            )
-        except Exception as e:
-            print(f"  Failed to close PR: {e}")
+        """Queue closing a PR for Daniel's approval."""
+        from src import approvals
+        approvals.request(
+            "close PR",
+            f"Close https://github.com/{owner_repo}/pull/{pr_number}",
+            [["gh", "pr", "close", pr_number, "--repo", owner_repo]],
+        )
 
     def _check_for_patterns(self, body: str, repo_full_name: str):
         """Extract learned patterns from review feedback."""

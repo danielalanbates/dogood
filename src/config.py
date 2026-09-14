@@ -1,5 +1,6 @@
 """Configuration management for dogood."""
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -243,6 +244,26 @@ _tiers_cache: dict = {"mtime": 0.0, "architect_mtime": 0.0, "tiers": []}
 
 
 PRIMARY_MODEL = os.getenv("DOGOOD_PRIMARY_MODEL", "claude-fable-5-1")
+# Written by the Do Good Factory menu bar app's AI Models dropdowns.
+MODEL_CHOICE_FILE = Path.home() / "Library/Application Support/BatesAI/shared/dogood_models.json"
+
+
+def _chosen_model(role: str) -> str:
+    try:
+        model = json.loads(MODEL_CHOICE_FILE.read_text()).get(role)
+        if isinstance(model, str) and model.startswith("claude-"):
+            return model
+    except Exception:
+        pass
+    return PRIMARY_MODEL
+
+
+def primary_model() -> str:
+    return _chosen_model("primary")
+
+
+def reviewer_model() -> str:
+    return _chosen_model("reviewer")
 # A PR is only posted when the independent acceptance review scores at least this.
 AUTO_SUBMIT_MIN_CONFIDENCE = float(os.getenv("AUTO_SUBMIT_MIN_CONFIDENCE", "0.95"))
 
@@ -250,7 +271,7 @@ AUTO_SUBMIT_MIN_CONFIDENCE = float(os.getenv("AUTO_SUBMIT_MIN_CONFIDENCE", "0.95
 def load_model_tiers() -> list[dict]:
     """Load model tiers. Fable 5.1 is the sole primary driver (Daniel, 2026-09-12)."""
     return [
-        {"tier": 1, "model": PRIMARY_MODEL, "effort": "high", "thinking": True, "label": "fable-high"},
+        {"tier": 1, "model": primary_model(), "effort": "high", "thinking": True, "label": "fable-high"},
     ]
 
 
