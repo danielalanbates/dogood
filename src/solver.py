@@ -401,9 +401,15 @@ class Solver:
                         }
 
                 from src.config import AUTO_SUBMIT_MIN_CONFIDENCE
-                confidence, review_notes = self._acceptance_review(
-                    clone_path, owner, repo_name, issue, issue_context, guidelines
-                )
+                # Flag file lets the menu bar icon show yellow while the Reviewer works.
+                reviewing_flag = Path("/tmp/dogood-reviewing")
+                reviewing_flag.write_text(f"{owner}/{repo_name}#{issue_number}")
+                try:
+                    confidence, review_notes = self._acceptance_review(
+                        clone_path, owner, repo_name, issue, issue_context, guidelines
+                    )
+                finally:
+                    reviewing_flag.unlink(missing_ok=True)
                 submit = confidence >= AUTO_SUBMIT_MIN_CONFIDENCE
                 self._approval_context = {
                     "contribution_id": contrib_id,

@@ -8,6 +8,8 @@ class StatusBarIcon: NSView {
         case healthy   // Green column bounces left to right
         case unhealthy // Red fill flashes on/off
         case paused    // Static amber: process alive, waiting on a limit
+        case reviewing // Static yellow: Reviewer is judging a fix
+        case readyToPost // Static orange: a fix is waiting for Daniel's yes
         case loading   // Static gray
     }
 
@@ -79,6 +81,10 @@ class StatusBarIcon: NSView {
         case .paused:
             let fill = NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), xRadius: radius, yRadius: radius)
             NSColor.systemOrange.setFill()
+            fill.fill()
+        case .reviewing, .readyToPost:
+            let fill = NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), xRadius: radius, yRadius: radius)
+            (mode == .reviewing ? NSColor.systemYellow : NSColor.systemOrange).setFill()
             fill.fill()
         case .loading:
             drawStaticGray(in: rect, radius: radius)
@@ -152,7 +158,7 @@ class StatusBarIcon: NSView {
             // Slow flash cycle (~2s full cycle at 5fps)
             phase += 0.05
             if phase >= 1 { phase = 0 }
-        case .loading, .paused:
+        case .loading, .paused, .reviewing, .readyToPost:
             return  // No animation
         }
         render()

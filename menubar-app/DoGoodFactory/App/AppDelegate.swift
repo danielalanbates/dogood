@@ -41,6 +41,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return .terminateNow
     }
 
+    /// True when a fix passed review and is waiting for Daniel's yes on Telegram.
+    private static func approvalWaiting() -> Bool {
+        let path = NSHomeDirectory() + "/Library/Application Support/BatesAI/github-helper/data/approvals.jsonl"
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return false }
+        return text.split(separator: "\n").contains { line in
+            guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else { return false }
+            return obj["status"] as? String == "pending"
+        }
+    }
+
     private static func pipelineOk() -> Bool {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/bin/launchctl")
@@ -72,6 +82,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // on a limit, or Scout/Fixer's latest log line is an error.
         if !allHealthy || !factoryOk || !Self.pipelineOk() {
             statusIcon.mode = .unhealthy
+        } else if Self.approvalWaiting() {
+            statusIcon.mode = .readyToPost
+        } else if FileManager.default.fileExists(atPath: "/tmp/dogood-reviewing") {
+            statusIcon.mode = .reviewing
         } else {
             statusIcon.mode = .healthy
         }
