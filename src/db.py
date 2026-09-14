@@ -471,6 +471,8 @@ def get_next_unclaimed_issue(conn: sqlite3.Connection, min_stars: int = 1000,
     - Issues with body too short to be actionable (< 50 chars)
     """
     from src.config import SUPPORTED_LANGUAGES, BEGINNER_LABELS, BOUNTY_LABELS, CLA_ORGS, SIGNED_CLA_ORGS, SKIP_LABELS
+    from src.scout import ensure_columns, MIN_SCORE
+    ensure_columns(conn)
     lang_placeholders = ",".join("?" for _ in SUPPORTED_LANGUAGES)
     # Pre-filter CLA orgs at the query level (skip before forking/cloning)
     cla_orgs_to_skip = {o.lower() for o in CLA_ORGS} - {o.lower() for o in SIGNED_CLA_ORGS}
@@ -556,6 +558,7 @@ def get_next_unclaimed_issue(conn: sqlite3.Connection, min_stars: int = 1000,
           AND {beginner_excludes}
           AND {skip_excludes}
           AND LENGTH(COALESCE(i.body, '')) >= 50
+          AND COALESCE(i.scout_score, 50) >= {MIN_SCORE}
           {haiku_where}
           AND r.full_name NOT IN (SELECT full_name FROM repo_blacklist WHERE forgiven_at IS NULL)
           AND i.id NOT IN (SELECT issue_id FROM issue_claims WHERE status = 'active')
@@ -580,6 +583,8 @@ def get_next_unclaimed_issue(conn: sqlite3.Connection, min_stars: int = 1000,
         ORDER BY
           is_bounty DESC,
           is_sponsor DESC,
+          (i.scout_score IS NOT NULL) DESC,
+          COALESCE(i.scout_score, 0) DESC,
           is_help_wanted DESC,
           repo_merges DESC,
           is_focus_repo DESC,

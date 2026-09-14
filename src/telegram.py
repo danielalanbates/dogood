@@ -210,7 +210,7 @@ class TelegramDaemon:
 
         return "\n\n".join(parts)
 
-    FACTORY_LABELS = ["com.batesai.dogood.factory", "com.batesai.dogood.feedback",
+    FACTORY_LABELS = ["com.batesai.dogood.scout", "com.batesai.dogood.factory", "com.batesai.dogood.feedback",
                       "com.batesai.dogood.bountywatch"]
     HELP = ("Commands:\n"
             "status — what the factory is doing\n"
@@ -346,7 +346,9 @@ class TelegramDaemon:
         except OSError:
             lines.append("No factory log yet")
         lines.append(f"Waiting for your OK: {len(approvals.pending())}")
-        lines.append(f"Models: solver {primary_model()}, reviewer {reviewer_model()}")
+        from src.llm import model_for
+        lines.append(f"Models: scout {model_for('scout')}, fixer {primary_model()}, reviewer {reviewer_model()}")
+        lines.append("(factory = the Fixer; scout finds and rates issues; the Fixer takes the best-rated first)")
         return "\n".join(lines)
 
     def _ask_gemini(self, text: str, reply_to: dict) -> str | None:

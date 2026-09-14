@@ -1054,7 +1054,7 @@ CRITICAL guidelines:
         try:
             from src.llm import provider, run_agent_in
             if self.model_tier and provider(self.model_tier["model"]) == "agy":
-                print(f"  Solver: Antigravity {self.model_tier['model'][4:]}", flush=True)
+                print(f"  Fixer: Antigravity {self.model_tier['model'][4:]}", flush=True)
                 result_text = run_agent_in(clone_path, prompt, system_prompt)
                 raise _SkipClaudeSDK()
             from src.rate_coordinator import (
@@ -1462,7 +1462,7 @@ CRITICAL guidelines:
             ask=bool(ctx.get("propose")),
         )
         self._approval_context = None
-        print(f"  [APPROVAL GATE] PR NOT posted. Queued for human approval: "
+        print(f"  [APPROVAL GATE] PR NOT posted. Recorded (sent to Daniel only if review passed): "
               f"{upstream_owner}/{repo}#{issue_number} branch={branch_name} "
               f"-> {PENDING_PR_QUEUE}", flush=True)
         return "PENDING_APPROVAL"

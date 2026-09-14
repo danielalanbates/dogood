@@ -1115,6 +1115,13 @@ def clascan(
 
 
 @app.command()
+def scout():
+    """Background daemon: find open issues on GitHub and have an AI rate which are worth fixing."""
+    from src.scout import run_forever
+    run_forever()
+
+
+@app.command()
 def telegramd():
     """Telegram daemon: listens for Daniel's replies and posts them on GitHub."""
     from src.telegram import TelegramDaemon

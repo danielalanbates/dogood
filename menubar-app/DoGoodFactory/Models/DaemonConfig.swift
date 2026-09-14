@@ -18,6 +18,8 @@ struct DaemonConfig {
 
     /// Daemons shown in the menu UI
     static let all: [DaemonConfig] = [
+        DaemonConfig(label: "com.batesai.dogood.scout",
+                     displayName: "Scout (finds issues)", isCyclic: false),
         DaemonConfig(label: "com.batesai.dogood.feedback",
                      displayName: "Feedback Daemon", isCyclic: true),
         DaemonConfig(label: "com.batesai.dogood.telegramd",
