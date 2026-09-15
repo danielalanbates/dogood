@@ -441,7 +441,8 @@ def get_sponsor_repos(conn: sqlite3.Connection) -> set:
 
 # --- Next issue for factory ---
 
-def get_next_unclaimed_issue(conn: sqlite3.Connection, min_stars: int = 1000) -> dict | None:
+def get_next_unclaimed_issue(conn: sqlite3.Connection, min_stars: int = 1000,
+                             model_label: str = "") -> dict | None:
     """Get the next best issue to solve using the escalation & persistence algorithm.
 
     Priority order:
@@ -453,6 +454,12 @@ def get_next_unclaimed_issue(conn: sqlite3.Connection, min_stars: int = 1000) ->
     Focus Repos = top 20 non-blacklisted repos by combined_score.
     Persistence: after a merge, we stay in the same repo for the next issue.
 
+    When model_label contains 'haiku', additional sweet-spot filters are applied
+    to restrict to issues where haiku can achieve ~19% success rate:
+    - body >= 500 chars (more context = higher success)
+    - comments >= 1 (some discussion = clearer problem)
+    - no enhancement/feature/refactor labels
+
     Exclusions:
     - Repos with >= 10 strikes (unmerged PRs)
     - Repos in cooldown (1 week after unmerged PR)
@@ -460,8 +467,12 @@ def get_next_unclaimed_issue(conn: sqlite3.Connection, min_stars: int = 1000) ->
     - Already-contributed issues
     - Stale issues (>2yr old)
     - Repos not maintained in last 30 days
+    - Issues with non-actionable labels (discussion, question, wontfix, etc.)
+    - Issues with body too short to be actionable (< 50 chars)
     """
-    from src.config import SUPPORTED_LANGUAGES, BEGINNER_LABELS, BOUNTY_LABELS, CLA_ORGS, SIGNED_CLA_ORGS
+    from src.config import SUPPORTED_LANGUAGES, BEGINNER_LABELS, BOUNTY_LABELS, CLA_ORGS, SIGNED_CLA_ORGS, SKIP_LABELS
+    from src.scout import ensure_columns, MIN_SCORE
+    ensure_columns(conn)
     lang_placeholders = ",".join("?" for _ in SUPPORTED_LANGUAGES)
     # Pre-filter CLA orgs at the query level (skip before forking/cloning)
     cla_orgs_to_skip = {o.lower() for o in CLA_ORGS} - {o.lower() for o in SIGNED_CLA_ORGS}
@@ -472,13 +483,51 @@ def get_next_unclaimed_issue(conn: sqlite3.Connection, min_stars: int = 1000) ->
         "LOWER(i.labels) NOT LIKE ?" for _ in BEGINNER_LABELS
     )
     beginner_params = [f'%{label}%' for label in BEGINNER_LABELS]
+    # Build LIKE clauses to exclude non-actionable labels
+    skip_excludes = " AND ".join(
+        "LOWER(i.labels) NOT LIKE ?" for _ in SKIP_LABELS
+    )
+    skip_params = [f'%{label}%' for label in SKIP_LABELS]
     # Build bounty detection as OR of LIKE clauses
     bounty_checks = " OR ".join(
         "LOWER(i.labels) LIKE ?" for _ in BOUNTY_LABELS
     )
     bounty_params = [f'%{label}%' for label in BOUNTY_LABELS]
+
+    # --- Haiku sweet-spot filters ---
+    # Haiku-high only handles simple issues: docs, typos, single-file bug fixes.
+    # Skip anything complex (multi-file refactors, features, complex languages).
+    haiku_where = ""
+    haiku_params = []
+    if "haiku" in model_label.lower():
+        from src.model_selector import HAIKU_FILTERS
+        haiku_where += f" AND LENGTH(COALESCE(i.body, '')) >= {HAIKU_FILTERS['min_body_length']}"
+        haiku_where += f" AND i.comments_count >= {HAIKU_FILTERS['min_comments']}"
+        # Complexity cap — only grab issues haiku can handle
+        max_cx = HAIKU_FILTERS.get("max_complexity", 0.35)
+        haiku_where += f" AND COALESCE(i.complexity_score, 1.0) <= {max_cx}"
+        # Skip issues already marked as too complex
+        haiku_where += " AND COALESCE(i.estimated_model, '') != 'skipped'"
+        # Exclude complex labels
+        for lbl in HAIKU_FILTERS["exclude_labels"]:
+            haiku_where += " AND LOWER(COALESCE(i.labels, '[]')) NOT LIKE ?"
+            haiku_params.append(f'%{lbl}%')
+        # Exclude complex languages (Rust, C, C++, Go, Java, etc.)
+        exclude_langs = HAIKU_FILTERS.get("exclude_languages", set())
+        if exclude_langs:
+            lang_excludes = " AND LOWER(r.language) NOT IN (" + ",".join("?" for _ in exclude_langs) + ")"
+            haiku_where += lang_excludes
+            haiku_params.extend(l.lower() for l in exclude_langs)
+
+    # Per-model failure tracking: only count failures from the SAME model config.
+    # model_label format: "opus-high", etc.
+    # DB stores: model="claude-opus-4-6", effort="high"
+    # We match on LIKE '%haiku%' AND effort='low' style using the label parts.
+    _label_parts = model_label.lower().split("-") if model_label else []
+    _model_pattern = f"%{_label_parts[0]}%" if _label_parts else "%"
+    _effort_match = _label_parts[-1] if len(_label_parts) >= 2 else "%"
     # bounty_params go FIRST because the CASE WHEN is in the SELECT clause (before WHERE)
-    params = bounty_params + list(SUPPORTED_LANGUAGES) + [min_stars] + beginner_params + cla_params
+    params = bounty_params + list(SUPPORTED_LANGUAGES) + [min_stars] + beginner_params + skip_params + haiku_params + cla_params + [_model_pattern, _effort_match]
 
     row = conn.execute(f"""
         SELECT i.*, r.full_name, r.language, r.stars, r.owner, r.name as repo_name,
@@ -488,6 +537,9 @@ def get_next_unclaimed_issue(conn: sqlite3.Connection, min_stars: int = 1000) ->
                COALESCE(rs.strikes, 0) as repo_strikes,
                rs.last_merge_at,
                CASE WHEN ({bounty_checks}) THEN 1 ELSE 0 END as is_bounty,
+               CASE WHEN LOWER(COALESCE(i.labels, '[]')) LIKE '%help wanted%'
+                    OR LOWER(COALESCE(i.labels, '[]')) LIKE '%help-wanted%'
+                    THEN 1 ELSE 0 END as is_help_wanted,
                CASE WHEN r.id IN (
                    SELECT id FROM repositories
                    WHERE combined_score > 0
@@ -504,22 +556,42 @@ def get_next_unclaimed_issue(conn: sqlite3.Connection, min_stars: int = 1000) ->
           AND r.language IN ({lang_placeholders})
           AND r.stars >= ?
           AND {beginner_excludes}
+          AND {skip_excludes}
+          AND LENGTH(COALESCE(i.body, '')) >= 50
+          AND COALESCE(i.scout_score, 50) >= {MIN_SCORE}
+          {haiku_where}
           AND r.full_name NOT IN (SELECT full_name FROM repo_blacklist WHERE forgiven_at IS NULL)
           AND i.id NOT IN (SELECT issue_id FROM issue_claims WHERE status = 'active')
           AND i.id NOT IN (SELECT issue_id FROM contributions WHERE issue_id IS NOT NULL)
+          AND r.id NOT IN (
+              SELECT repo_id FROM contributions
+              WHERE status = 'pr_created'
+                AND created_at > datetime('now', '-1 day')
+                AND repo_id IS NOT NULL
+          )
+          AND i.id NOT IN (
+              SELECT issue_id FROM agent_runs
+              WHERE status = 'failed' AND issue_id IS NOT NULL
+                AND LOWER(model) LIKE ? AND LOWER(effort) = ?
+              GROUP BY issue_id HAVING COUNT(*) >= 3
+          )
           AND i.updated_at > datetime('now', '-2 years')
           AND (r.pushed_at IS NULL OR r.pushed_at > datetime('now', '-30 days'))
-          AND COALESCE(rs.strikes, 0) < 10
+          AND COALESCE(rs.strikes, 0) < 5
           AND (rs.cooldown_until IS NULL OR rs.cooldown_until < datetime('now'))
           AND {cla_excludes}
         ORDER BY
           is_bounty DESC,
           is_sponsor DESC,
-          is_focus_repo DESC,
+          (i.scout_score IS NOT NULL) DESC,
+          COALESCE(i.scout_score, 0) DESC,
+          is_help_wanted DESC,
           repo_merges DESC,
+          is_focus_repo DESC,
           CASE WHEN rs.last_merge_at IS NOT NULL
                THEN julianday('now') - julianday(rs.last_merge_at)
                ELSE 9999 END ASC,
+          COALESCE(rs.strikes, 0) ASC,
           r.combined_score DESC,
           i.priority_score DESC
         LIMIT 1
@@ -534,12 +606,17 @@ def get_next_tagged_issue(conn: sqlite3.Connection, tag: str,
     Used to reserve agent slots for priority categories like 'christian'.
     Falls back to highest-star repos first, then most open issues.
     """
-    from src.config import SUPPORTED_LANGUAGES, CLA_ORGS, SIGNED_CLA_ORGS
+    from src.config import SUPPORTED_LANGUAGES, CLA_ORGS, SIGNED_CLA_ORGS, SKIP_LABELS
     lang_placeholders = ",".join("?" for _ in SUPPORTED_LANGUAGES)
     cla_orgs_to_skip = {o.lower() for o in CLA_ORGS} - {o.lower() for o in SIGNED_CLA_ORGS}
     cla_excludes = " AND ".join("LOWER(r.owner) != ?" for _ in cla_orgs_to_skip) if cla_orgs_to_skip else "1=1"
     cla_params = list(cla_orgs_to_skip)
-    params = list(SUPPORTED_LANGUAGES) + [f'%"{tag}"%', min_stars] + cla_params
+    # Build LIKE clauses to exclude non-actionable labels
+    skip_excludes_tagged = " AND ".join(
+        "LOWER(i.labels) NOT LIKE ?" for _ in SKIP_LABELS
+    )
+    skip_params_tagged = [f'%{label}%' for label in SKIP_LABELS]
+    params = list(SUPPORTED_LANGUAGES) + [f'%"{tag}"%', min_stars] + skip_params_tagged + cla_params
 
     row = conn.execute(f"""
         SELECT i.*, r.full_name, r.language, r.stars, r.owner, r.name as repo_name,
@@ -554,9 +631,22 @@ def get_next_tagged_issue(conn: sqlite3.Connection, tag: str,
           AND r.language IN ({lang_placeholders})
           AND r.tags LIKE ?
           AND r.stars >= ?
+          AND {skip_excludes_tagged}
+          AND LENGTH(COALESCE(i.body, '')) >= 50
           AND r.full_name NOT IN (SELECT full_name FROM repo_blacklist WHERE forgiven_at IS NULL)
           AND i.id NOT IN (SELECT issue_id FROM issue_claims WHERE status = 'active')
           AND i.id NOT IN (SELECT issue_id FROM contributions WHERE issue_id IS NOT NULL)
+          AND r.id NOT IN (
+              SELECT repo_id FROM contributions
+              WHERE status = 'pr_created'
+                AND created_at > datetime('now', '-1 day')
+                AND repo_id IS NOT NULL
+          )
+          AND i.id NOT IN (
+              SELECT issue_id FROM agent_runs
+              WHERE status = 'failed' AND issue_id IS NOT NULL
+              GROUP BY issue_id HAVING COUNT(*) >= 3
+          )
           AND i.updated_at > datetime('now', '-2 years')
           AND COALESCE(rs.strikes, 0) < 10
           AND (rs.cooldown_until IS NULL OR rs.cooldown_until < datetime('now'))

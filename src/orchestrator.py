@@ -1,25 +1,22 @@
-"""Agent factory: spawns concurrent agents as subprocesses, manages lifecycle.
+"""Agent factory: runs solver inline, one issue at a time. No subprocesses.
 
-Rate limit strategy:
-- Start all agents at sonnet-low (tier 1)
-- When ANY agent hits a rate limit, orchestrator bumps 1 agent to the next tier
-- This spreads agents across model rate limit pools for maximum throughput
-- Track observed rate limits per model to learn caps over time
-- At max tier (opus-thinking) + still limited → reduce concurrency
+Architecture (simplified 2026-03-07):
+- Previously spawned concurrent subprocesses (claude CLI as child processes)
+- Now runs solver.solve_issue() directly in the same process
+- One issue at a time, sequentially — no concurrency, no subprocess crashes
+- All issue selection, prioritization, rate limiting, and quality gates preserved
 """
 
 import asyncio
 import json
-import os
 import re
-import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from src.config import (
-    MAX_CONCURRENT_AGENTS, AGENT_CLAIM_TTL_MINUTES,
-    MIN_STARS_DEFAULT, LOG_FILE, MAX_OPUS_PER_ISSUE, PROJECT_ROOT,
+    AGENT_CLAIM_TTL_MINUTES,
+    MIN_STARS_DEFAULT, LOG_FILE,
     load_model_tiers,
 )
 from src.concurrency import (
@@ -27,14 +24,20 @@ from src.concurrency import (
     claim_issue, release_claim, cleanup_agent_work_dir,
 )
 from src.rate_coordinator import is_in_cooldown, seconds_until_clear
+from src.pr_safety import can_create_pr, record_pr_created, check_close_ratio, can_pr_repo, record_repo_pr
 from src.db import (
     get_next_unclaimed_issue, get_next_tagged_issue,
     record_agent_run, update_agent_run,
-    get_opus_attempts_for_issue,
     get_next_feedback_revision, update_feedback_status,
 )
-from src.model_selector import score_complexity, get_next_tier
+from src.model_selector import get_next_tier
+from src.telegram import notify_plain, notify_github_attention
 from src.utils import generate_agent_id, now_iso
+
+
+class FactoryHaltedError(Exception):
+    """Raised when the factory detects a systemic failure and must halt."""
+    pass
 
 
 RATE_LIMIT_SIGNAL_FILE = Path("/tmp/dogood-rate-limit-signal.json")
@@ -212,23 +215,27 @@ class TierDistributor:
 
 
 class AgentFactory:
-    """Spawns and manages concurrent issue-solving agents as subprocesses."""
+    """Runs solver inline, one issue at a time. No subprocesses."""
 
-    def __init__(self, max_concurrent: int = MAX_CONCURRENT_AGENTS,
+    def __init__(self, max_concurrent: int = 1,
                  min_stars: int = MIN_STARS_DEFAULT,
                  max_cost_usd: float = 0.0):
-        self.max_concurrent = max_concurrent
+        # Always 1 at a time — no concurrency
+        self.max_concurrent = 1
         self.min_stars = min_stars
         self.max_cost_usd = max_cost_usd  # 0 = unlimited
         self.pool = ConnectionPool()
         self.rate_limiter = SharedRateLimiter(self.pool)
         self.log_writer = LogWriter(LOG_FILE)
-        self._semaphore = asyncio.Semaphore(max_concurrent)
         self._stats = {"started": 0, "succeeded": 0, "failed": 0, "skipped": 0, "escalated": 0}
         self._total_cost = 0.0
-        self._christian_agent_active = False
         self._tier_distributor = TierDistributor()
         self._active_agents = {}  # agent_id -> {repo, issue, started}
+        # Self-diagnosis state
+        self._consecutive_failures = 0
+        self._consecutive_error_class = None
+        self._error_class_counts: dict[str, int] = {}
+        self._diagnosis_history: list[dict] = []  # last 50 failure records
 
     def _write_status(self, factory_running: bool = True):
         """Write factory status to a file for the status bar app to read."""
@@ -239,45 +246,274 @@ class AgentFactory:
                 "stats": self._stats.copy(),
                 "max_concurrent": self.max_concurrent,
                 "factory_running": factory_running,
+                "error_class_counts": self._error_class_counts.copy(),
+                "consecutive_failures": self._consecutive_failures,
+                "consecutive_error_class": self._consecutive_error_class,
                 "updated": datetime.now().isoformat(),
             }
             FACTORY_STATUS_FILE.write_text(json.dumps(status))
         except Exception:
             pass
 
-    async def run(self, max_issues: int = 100):
-        """Main factory loop: get issues, spawn agent subprocesses, track results."""
-        budget_msg = f", budget=${self.max_cost_usd:.2f}" if self.max_cost_usd else ""
-        print(f"Agent Factory starting: max_concurrent={self.max_concurrent}, "
-              f"min_stars={self.min_stars}, max_issues={max_issues}{budget_msg}", flush=True)
+    def _classify_error(self, error_text: str, extra_context: str = "",
+                        returncode: int = 1) -> dict:
+        """Classify an error into a category for diagnosis.
 
-        tasks = []
+        Works in inline mode (error_text is a Python exception/error string)
+        and legacy subprocess mode (error_text is stdout, extra_context is stderr).
+
+        Args:
+            error_text: Primary error string (exception message or stdout)
+            extra_context: Additional context (stderr or traceback)
+            returncode: Exit code (default 1 for inline mode)
+        """
+        # Guard against None arguments
+        error_text = error_text or ""
+        extra_context = extra_context or ""
+
+        combined = f"{error_text}\n{extra_context}".lower()
+        raw = f"{error_text}\n{extra_context}"[-500:]
+
+        # Exit code 2 = skip (quality gate, CLA, anti-AI, etc.) — benign, not a failure
+        if returncode == 2:
+            return {"class": "skipped", "message": "Skipped (quality gate/policy)", "raw": raw}
+
+        # Quality gate / skip patterns — classify separately from SDK errors
+        skip_patterns = ["quality gate", "blocked_quality_gate", "skipped:",
+                         "anti-ai policy", "requires cla", "unsupported language",
+                         "duplicate pr", "blocked org", "issue quality too low",
+                         "skipped_low_quality"]
+        for pat in skip_patterns:
+            if pat in combined:
+                return {"class": "skipped", "message": f"Skip: {pat}", "raw": raw}
+
+        # Billing / credit errors
+        billing_patterns = ["credit balance", "billing_error", "payment required",
+                            "insufficient_quota", "balance is too low",
+                            "error result: success", "reached your fable limit", "manage usage credits"]
+        for pat in billing_patterns:
+            if pat in combined:
+                return {"class": "billing_error", "message": f"Billing: {pat}", "raw": raw}
+
+        # Auth errors
+        auth_patterns = ["not logged in", "invalid api key", "unauthorized",
+                         "invalid_api_key", "authentication_error", "api key is invalid"]
+        for pat in auth_patterns:
+            if pat in combined:
+                return {"class": "auth_error", "message": f"Auth: {pat}", "raw": raw}
+
+        # Rate limits (tracked for diagnosis even though handled elsewhere)
+        rate_patterns = ["rate_limit", "rate limit", "hit your limit", "you've hit your limit",
+                         "you've hit your limit", "too many requests"]
+        for pat in rate_patterns:
+            if pat in combined:
+                return {"class": "rate_limit", "message": f"Rate limit: {pat}", "raw": raw}
+
+        # "No changes produced" — per-issue problem, not systemic
+        no_changes_patterns = ["no changes produced", "no changes produced by claude"]
+        for pat in no_changes_patterns:
+            if pat in combined:
+                return {"class": "no_changes", "message": f"No changes: {pat}", "raw": raw}
+
+        # Repo / git errors
+        repo_patterns = ["clone failed", "push failed", "git push", "git clone",
+                         "repository not found", "remote: repository not found",
+                         "fatal: could not read from remote",
+                         "connection reset by peer", "clone timed out"]
+        for pat in repo_patterns:
+            if pat in combined:
+                return {"class": "repo_error", "message": f"Repo: {pat}", "raw": raw}
+
+        # SDK / subprocess errors
+        sdk_patterns = ["command failed with exit code", "traceback (most recent",
+                        "modulenotfounderror", "importerror",
+                        "fatal error in message reader",
+                        "processerror", "cliconnectionerror"]
+        
+        # Check if SDK error contains rate limit info (captured by our patched SDK)
+        if any(p in raw for p in rate_patterns):
+            return {"class": "rate_limit", "message": "Rate limit hit (CLI output contained limit message)", "raw": raw}
+        for pat in sdk_patterns:
+            if pat in combined:
+                return {"class": "sdk_error", "message": f"SDK: {pat}", "raw": raw}
+
+        # Unknown — extract a useful snippet for the message
+        snippet = error_text[-200:] if error_text.strip() else extra_context[-200:] if extra_context.strip() else f"exit code {returncode}"
+        return {"class": "unknown", "message": snippet.strip()[:200], "raw": raw}
+
+    async def _diagnose_and_react(self, error_info: dict, agent_id: str, issue_info: dict):
+        """Update failure counters and trigger corrective action if needed."""
+        error_class = error_info["class"]
+
+        # Skips are benign — don't count toward failure streaks
+        if error_class == "skipped":
+            self._error_class_counts[error_class] = self._error_class_counts.get(error_class, 0) + 1
+            return
+
+        # Repo errors and "no changes" are per-issue, not systemic — don't count toward failure streaks
+        if error_class in ("repo_error", "no_changes"):
+            self._error_class_counts[error_class] = self._error_class_counts.get(error_class, 0) + 1
+            self._consecutive_failures = 0
+            self._consecutive_error_class = None
+            return
+
+        # Update consecutive failure tracking
+        if error_class == self._consecutive_error_class:
+            self._consecutive_failures += 1
+        else:
+            self._consecutive_failures = 1
+            self._consecutive_error_class = error_class
+
+        # Update class counts
+        self._error_class_counts[error_class] = self._error_class_counts.get(error_class, 0) + 1
+
+        # Append to diagnosis history (ring buffer of 50)
+        self._diagnosis_history.append({
+            "time": now_iso(),
+            "agent_id": agent_id,
+            "issue": f"{issue_info.get('full_name', '?')}#{issue_info.get('number', '?')}",
+            "class": error_class,
+            "message": error_info["message"][:200],
+        })
+        self._diagnosis_history = self._diagnosis_history[-50:]
+
+        # Trigger corrective actions based on error class and streak
+        n = self._consecutive_failures
+
+        if error_class == "billing_error" and n >= 1:
+            await self._pause_factory(
+                reason=f"billing_error (streak={n})",
+                message=(
+                    f"FACTORY PAUSED: Billing error detected\n"
+                    f"Error: {error_info['message']}\n"
+                    f"The API key has run out of credits. "
+                    f"Factory will auto-resume in 5 hours."
+                ),
+                pause_hours=5,
+            )
+        elif error_class == "auth_error" and n >= 1:
+            await self._pause_factory(
+                reason=f"auth_error (streak={n})",
+                message=(
+                    f"FACTORY HALTED: Authentication error\n"
+                    f"Error: {error_info['message']}\n"
+                    f"API key is invalid or expired. Manual intervention required."
+                ),
+                pause_hours=0,  # indefinite — halt
+            )
+        elif error_class == "rate_limit" and n >= 5:
+            await self._pause_factory(
+                reason=f"rate_limit (streak={n})",
+                message=(
+                    f"FACTORY PAUSED: {n} consecutive rate limits\n"
+                    f"All model tiers appear saturated. "
+                    f"Factory will auto-resume in 1 hour."
+                ),
+                pause_hours=1,
+            )
+        elif error_class == "sdk_error" and n >= 10:
+            await self._pause_factory(
+                reason=f"sdk_error (streak={n})",
+                message=(
+                    f"FACTORY PAUSED: {n} consecutive SDK errors\n"
+                    f"Last error: {error_info['message'][:150]}\n"
+                    f"Factory will auto-resume in 1 hour."
+                ),
+                pause_hours=1,
+            )
+        elif error_class == "unknown" and n >= 5:
+            await self._pause_factory(
+                reason=f"unknown_error (streak={n})",
+                message=(
+                    f"FACTORY PAUSED: {n} consecutive unknown errors\n"
+                    f"Last error: {error_info['message'][:150]}\n"
+                    f"Factory will auto-resume in 30 minutes and retry with different issues."
+                ),
+                pause_hours=0.5,  # 30 min pause then auto-resume
+            )
+        # repo_error: no factory-level action (per-issue skip handled elsewhere)
+
+    async def _pause_factory(self, reason: str, message: str, pause_hours: float):
+        """Pause or halt the factory, send notification, write logs."""
+        # Build diagnostic report
+        report_lines = [
+            message,
+            "",
+            f"--- Diagnostic Report ---",
+            f"Error breakdown: {json.dumps(self._error_class_counts)}",
+            f"Factory stats: {json.dumps(self._stats)}",
+            f"Consecutive failures: {self._consecutive_failures} ({self._consecutive_error_class})",
+        ]
+        # Last 5 failures
+        recent = self._diagnosis_history[-5:]
+        if recent:
+            report_lines.append("Last failures:")
+            for entry in recent:
+                report_lines.append(
+                    f"  [{entry['time']}] {entry['class']}: {entry['issue']} — {entry['message'][:80]}"
+                )
+
+        report = "\n".join(report_lines)
+
+        # Factory diagnostics logged locally only (CEO only wants actionable alerts)
+        print(f"  [DIAGNOSIS] {report[:500]}", flush=True)
+
+        # Write to markdown log
+        self.log_writer.append_entry(
+            f"## {datetime.now().strftime('%Y-%m-%d %H:%M')} — FACTORY {'PAUSED' if pause_hours > 0 else 'HALTED'}\n"
+            f"**Reason:** {reason}\n"
+            f"**Error counts:** {json.dumps(self._error_class_counts)}\n"
+            f"**Stats:** started={self._stats['started']}, succeeded={self._stats['succeeded']}, "
+            f"failed={self._stats['failed']}\n"
+            f"---"
+        )
+
+        # Update status file
+        try:
+            status = {
+                "factory_running": False,
+                "pause_status": "paused" if pause_hours > 0 else "halted",
+                "pause_reason": reason,
+                "pause_until": (datetime.now().isoformat() if pause_hours == 0
+                                else datetime.fromtimestamp(
+                                    time.time() + pause_hours * 3600
+                                ).isoformat()),
+                "error_class_counts": self._error_class_counts.copy(),
+                "consecutive_failures": self._consecutive_failures,
+                "stats": self._stats.copy(),
+                "updated": datetime.now().isoformat(),
+            }
+            FACTORY_STATUS_FILE.write_text(json.dumps(status))
+        except Exception:
+            pass
+
+        print(f"  [DIAGNOSIS] {reason}: factory {'pausing' if pause_hours > 0 else 'halting'}",
+              flush=True)
+
+        if pause_hours > 0:
+            print(f"  [DIAGNOSIS] Sleeping {pause_hours}h, will auto-resume...", flush=True)
+            await asyncio.sleep(pause_hours * 3600)
+            # Reset counters on resume
+            self._consecutive_failures = 0
+            self._consecutive_error_class = None
+            print(f"  [DIAGNOSIS] Resuming factory after {pause_hours}h pause", flush=True)
+        else:
+            raise FactoryHaltedError(reason)
+
+    async def run(self, max_issues: int = 100):
+        """Main factory loop: pick issue, solve inline, repeat. One at a time."""
+        budget_msg = f", budget=${self.max_cost_usd:.2f}" if self.max_cost_usd else ""
+        tiers = load_model_tiers()
+        tier1_label = tiers[0]["label"] if tiers else "unknown"
+        print(f"Agent Factory starting: INLINE mode (no subprocesses), "
+              f"min_stars={self.min_stars}, max_issues={max_issues}{budget_msg}, "
+              f"model={tier1_label}", flush=True)
+
         issues_started = 0
 
         bounty_signal = Path("/tmp/bounty-agent-active.signal")
 
         while issues_started < max_issues:
-            # Auto-throttle when interactive Claude Code is running in terminal
-            try:
-                import subprocess as _sp
-                # Find claude processes, exclude our SDK agents (ENTRYPOINT=sdk-py)
-                cc_check = _sp.run(
-                    ["bash", "-c",
-                     "ps -eo pid,command | grep '[c]laude ' | grep -v sdk-py | grep -v ShipIt | grep -c ."],
-                    capture_output=True, text=True, timeout=5
-                )
-                interactive_count = int(cc_check.stdout.strip()) if cc_check.returncode == 0 else 0
-                if interactive_count > 0 and self._semaphore._value > 1:
-                    self._semaphore = asyncio.Semaphore(1)
-                    print("  [THROTTLE] Claude Code active in terminal — limiting to 1 agent",
-                          flush=True)
-                elif interactive_count == 0 and self._semaphore._value < self.max_concurrent:
-                    self._semaphore = asyncio.Semaphore(self.max_concurrent)
-                    print(f"  [RESTORE] Claude Code exited — restoring to {self.max_concurrent} agents",
-                          flush=True)
-            except Exception:
-                pass
-
             # Check if bounty agent needs priority — pause factory if bounties active
             if bounty_signal.exists():
                 try:
@@ -291,32 +527,35 @@ class AgentFactory:
                 except Exception:
                     pass
 
-            # Check for rate limit signals from agents
-            self._check_rate_limit_signals()
-
-            # If all tiers are saturated and we're at max, reduce concurrency
-            if self._tier_distributor.is_at_max_tier() and self.max_concurrent > 1:
-                # Check if there was a very recent signal
-                try:
-                    if RATE_LIMIT_SIGNAL_FILE.exists():
-                        sig = json.loads(RATE_LIMIT_SIGNAL_FILE.read_text())
-                        if time.time() - sig.get("time", 0) < 120:
-                            old = self.max_concurrent
-                            self.max_concurrent = max(1, self.max_concurrent - 1)
-                            self._semaphore = asyncio.Semaphore(self.max_concurrent)
-                            print(f"  [THROTTLE] All tiers saturated — "
-                                  f"reducing concurrency {old} → {self.max_concurrent}",
-                                  flush=True)
-                            RATE_LIMIT_SIGNAL_FILE.unlink(missing_ok=True)
-                except Exception:
-                    pass
-
-            # Check shared rate limit cooldown — don't spawn during API saturation
+            # Check shared rate limit cooldown
             if is_in_cooldown():
                 wait_secs = seconds_until_clear()
-                print(f"  [COOLDOWN] Anthropic API rate limited — waiting {wait_secs:.0f}s before next spawn",
+                print(f"  [COOLDOWN] Anthropic API rate limited — waiting {wait_secs:.0f}s",
                       flush=True)
                 await asyncio.sleep(wait_secs + 5)
+                continue
+
+            # PR safety: daily cap + close ratio guard
+            pr_allowed, pr_reason = can_create_pr()
+            if not pr_allowed:
+                # Sleep until local midnight + 60s buffer so the date rolls over
+                # and the safety file resets. Avoids spam-logging every 5 minutes.
+                now = datetime.now()
+                midnight = (now + timedelta(days=1)).replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                )
+                sleep_secs = (midnight - now).total_seconds() + 60
+                print(f"  [PR SAFETY] {pr_reason} — sleeping {sleep_secs/3600:.1f}h "
+                      f"until midnight", flush=True)
+                self._write_status(factory_running=False)
+                await asyncio.sleep(sleep_secs)
+                self._write_status(factory_running=True)
+                continue
+
+            ratio_ok, ratio_msg = check_close_ratio()
+            if not ratio_ok:
+                print(f"  [PR SAFETY] {ratio_msg}", flush=True)
+                await asyncio.sleep(600)
                 continue
 
             # Check budget
@@ -328,15 +567,12 @@ class AgentFactory:
                 print(f"  WARNING: At 80% budget: ${self._total_cost:.2f} / ${self.max_cost_usd:.2f}",
                       flush=True)
 
-            # Wait for a semaphore slot
-            await self._semaphore.acquire()
+            conn = self.pool.get()
 
             # PRIORITY #1: Check for feedback that needs revision
-            conn = self.pool.get()
             feedback_item = get_next_feedback_revision(conn)
             if feedback_item:
                 agent_id = generate_agent_id()
-                # Use mandatory_model from DB if set, otherwise opus-high
                 tiers = load_model_tiers()
                 mandatory = feedback_item.get("mandatory_model", "opus-high")
                 model_tier = next((t for t in tiers if t.get("label") == mandatory),
@@ -360,46 +596,47 @@ class AgentFactory:
                 self._active_agents[agent_id] = {
                     "repo": feedback_item.get("full_name", "?"),
                     "type": "feedback",
+                    "model": model_tier.get("label", "unknown"),
                     "started": now_iso(),
                 }
                 self._write_status()
 
-                task = asyncio.create_task(
-                    self._run_feedback_subprocess(agent_id, feedback_item, model_tier)
-                )
-                tasks.append(task)
-                await asyncio.sleep(10)
+                await self._run_feedback_inline(agent_id, feedback_item, model_tier)
                 continue
 
-            # Get next issue — reserve 1 slot for Christian repos
-            issue = None
-            if not self._christian_agent_active:
-                issue = get_next_tagged_issue(conn, "christian", min_stars=0)
-                if issue:
-                    issue["_tagged"] = "christian"
-                    print(f"  [CHRISTIAN] Prioritizing Christian repo: "
-                          f"{issue['full_name']}#{issue['number']}", flush=True)
+            # PRIORITY #2: Christian repos
+            issue = get_next_tagged_issue(conn, "christian", min_stars=0)
+            if issue:
+                issue["_tagged"] = "christian"
+                print(f"  [CHRISTIAN] Prioritizing Christian repo: "
+                      f"{issue['full_name']}#{issue['number']}", flush=True)
+
+            # PRIORITY #3: Regular issues
             if not issue:
-                issue = get_next_unclaimed_issue(conn, self.min_stars)
+                tiers = load_model_tiers()
+                tier1_label = tiers[0]["label"] if tiers else ""
+                issue = get_next_unclaimed_issue(conn, self.min_stars,
+                                                 model_label=tier1_label)
             if not issue:
-                self._semaphore.release()
-                if tasks:
-                    print("No more issues. Waiting for active agents to finish...")
-                    break
-                else:
-                    print("No eligible issues found.")
-                    return self._stats
+                print("No eligible issues found.")
+                break
 
             agent_id = generate_agent_id()
 
-            # Claim the issue before spawning
+            # Claim the issue
             claimed = await claim_issue(self.pool, issue["id"], agent_id,
                                         AGENT_CLAIM_TTL_MINUTES)
             if not claimed:
-                self._semaphore.release()
                 continue
 
-            # Daniel Tier System: all regular agents run at tier 1 (sonnet-low)
+            # Per-repo rate limit: max 1 PR per repo per 24 hours
+            repo_allowed, repo_reason = can_pr_repo(issue["full_name"])
+            if not repo_allowed:
+                print(f"  [REPO RATE LIMIT] {repo_reason} — skipping", flush=True)
+                await release_claim(self.pool, issue["id"], agent_id, "rate_limited")
+                continue
+
+            # Select model tier
             tiers = load_model_tiers()
             model_tier = tiers[0].copy()
 
@@ -407,6 +644,13 @@ class AgentFactory:
             if issue.get("is_bounty"):
                 model_tier = tiers[-1].copy()
                 print(f"  Agent {agent_id}: BOUNTY detected — using {model_tier['label']}")
+
+            # Sponsor/donor repos: always use opus
+            from src.db import get_sponsor_repos
+            sponsor_repos = get_sponsor_repos(conn)
+            if issue.get("full_name") in sponsor_repos:
+                model_tier = tiers[-1].copy()
+                print(f"  Agent {agent_id}: SPONSOR repo — using {model_tier['label']}")
 
             print(f"  Agent {agent_id}: {issue['full_name']}#{issue['number']} "
                   f"[{model_tier['label']}] — {issue.get('title', '')[:50]}",
@@ -424,34 +668,21 @@ class AgentFactory:
 
             self._stats["started"] += 1
             issues_started += 1
+            task_type = "bounty" if issue.get("is_bounty") else "fix"
             self._active_agents[agent_id] = {
                 "repo": issue.get("full_name", "?"),
                 "issue": f"#{issue.get('number', '?')}",
-                "type": "fix",
+                "type": task_type,
+                "model": model_tier.get("label", "unknown"),
                 "started": now_iso(),
             }
             self._write_status()
 
-            # Stagger agent spawns — 60s between each
-            await asyncio.sleep(60)
-
-            # Track Christian agent slot
-            is_christian = issue.get("_tagged") == "christian"
-            if is_christian:
-                self._christian_agent_active = True
-
-            # Spawn agent as subprocess
-            task = asyncio.create_task(
-                self._run_agent_subprocess(agent_id, issue, model_tier,
-                                           is_christian=is_christian)
-            )
-            tasks.append(task)
-
-        # Wait for all tasks to complete
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            # Run solver INLINE — no subprocess, same process
+            await self._run_agent_inline(agent_id, issue, model_tier)
 
         print(f"\nFactory complete: {self._stats}")
+        self._write_status(factory_running=False)
         return self._stats
 
     def _check_rate_limit_signals(self):
@@ -469,13 +700,12 @@ class AgentFactory:
         except Exception:
             pass
 
-    async def _run_agent_subprocess(self, agent_id: str, issue: dict,
-                                     model_tier: dict, is_christian: bool = False):
-        """Run a single agent as a subprocess that calls `dogood solve`."""
+    async def _run_agent_inline(self, agent_id: str, issue: dict, model_tier: dict):
+        """Run solver.solve_issue() directly in this process. No subprocess."""
+        from src.solver import Solver
         conn = self.pool.get()
         full_name = issue["full_name"]
         issue_number = issue["number"]
-        python = sys.executable
 
         try:
             update_agent_run(conn, agent_id, status="fixing")
@@ -483,64 +713,31 @@ class AgentFactory:
             # Wait for rate limit
             await self.rate_limiter.wait_for_slot("github_api")
 
-            # Build the solve command — run as a separate process
-            cmd = [
-                python, "-m", "src.cli", "solve",
-                "--issue-id", str(issue["id"]),
-                "--agent-id", agent_id,
-                "--model-tier", json.dumps(model_tier),
-            ]
-            if issue.get("is_bounty"):
-                cmd.append("--is-bounty")
-
-            env = os.environ.copy()
-            # Strip all Claude Code env vars to avoid "nested session" detection
-            for key in list(env):
-                if "CLAUDE" in key.upper():
-                    env.pop(key)
-
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=str(PROJECT_ROOT),
-                env=env,
+            # Create solver and run inline
+            solver = Solver(
+                agent_id=agent_id,
+                model_tier=model_tier,
+                is_bounty=bool(issue.get("is_bounty")),
             )
+            result = await solver.solve_issue(issue["id"])
 
-            stdout, stderr = await proc.communicate()
-            stdout_text = stdout.decode() if stdout else ""
-            stderr_text = stderr.decode() if stderr else ""
-
-            if proc.returncode == 2:
-                # Exit code 2 = skipped (unsupported language, duplicate PR, CLA, etc.)
-                skip_reason = stdout_text.strip().split("\n")[-1] if stdout_text.strip() else "skipped"
-                update_agent_run(conn, agent_id, status="failed",
-                                 error=f"skipped: {skip_reason[:200]}",
-                                 finished_at=now_iso())
-                self._stats["skipped"] = self._stats.get("skipped", 0) + 1
-                print(f"  Agent {agent_id}: skipped — {skip_reason[:80]}")
-                # No cost incurred for skips, clear saturation
-                self._tier_distributor.clear_saturation(model_tier["model"])
-            elif proc.returncode == 0:
-                # Check if a PR was created by looking at stdout
-                pr_url = ""
-                for line in stdout_text.split("\n"):
-                    if "https://github.com/" in line and "/pull/" in line:
-                        match = re.search(r'(https://github\.com/\S+/pull/\d+)', line)
-                        if match:
-                            pr_url = match.group(1)
-                            break
-
+            if result.get("success"):
+                pr_url = result.get("pr_url", "")
                 if pr_url:
+                    record_pr_created()
+                    record_repo_pr(full_name)
                     update_agent_run(conn, agent_id,
                                      status="pr_created",
                                      pr_url=pr_url,
                                      finished_at=now_iso(),
                                      cost_usd=model_tier.get("max_budget_usd", 0))
                     self._stats["succeeded"] += 1
-                    print(f"  Agent {agent_id}: PR created — {pr_url}")
+                    self._consecutive_failures = 0
+                    self._consecutive_error_class = None
+                    print(f"  Agent {agent_id}: PR created — {pr_url}", flush=True)
 
-                    # Model worked without rate limit — clear saturation
+                    # PR creation logged but not sent to Telegram (CEO only wants actionable alerts)
+
                     self._tier_distributor.clear_saturation(model_tier["model"])
 
                     self.log_writer.append_entry(
@@ -554,97 +751,88 @@ class AgentFactory:
                         f"---"
                     )
                 else:
-                    # Process succeeded but no PR URL found — check if it was a no-op
-                    error_msg = "No changes made" if "No changes" in stdout_text else stdout_text[-200:]
                     update_agent_run(conn, agent_id, status="failed",
-                                     error=error_msg, finished_at=now_iso())
+                                     error="No PR URL in result", finished_at=now_iso())
                     self._stats["failed"] += 1
-                    print(f"  Agent {agent_id}: no PR — {error_msg[:80]}")
-
-                    # Still succeeded at the API level — clear saturation
-                    self._tier_distributor.clear_saturation(model_tier["model"])
+                    print(f"  Agent {agent_id}: success but no PR URL", flush=True)
             else:
-                error_msg = stderr_text[-300:] if stderr_text else f"exit code {proc.returncode}"
+                error = result.get("error") or "Unknown error"
 
-                # Check if the failure was a real rate limit (not benign SDK event)
-                combined = f"{stdout_text} {stderr_text}".lower()
-                is_rate_limited = (
-                    "rate_limit" in combined or "rate limit" in combined
-                    or "you've hit your limit" in combined
-                    or "hit your limit" in combined
-                )
-                is_benign = "benign sdk" in combined or "unknown message type" in combined
-                if is_rate_limited and not is_benign:
-                    self._stats["escalated"] += 1
-                    reset_match = re.search(r'resets\s+(\d{1,2}(?:am|pm))', combined)
-                    reset_info = reset_match.group(1) if reset_match else ""
+                # Classify the error for diagnosis
+                error_info = self._classify_error(error)
+
+                # Check if it's a skip vs real failure
+                is_skip = any(kw in error.lower() for kw in [
+                    "unsupported language", "duplicate pr", "anti-ai", "requires cla",
+                    "quality gate", "blocked org", "blocked_quality_gate",
+                    "skipped_blocked_org", "skipped_language", "skipped_duplicate_pr",
+                    "issue quality too low", "skipped_low_quality",
+                    "pending human approval",
+                ])
+                if is_skip:
                     update_agent_run(conn, agent_id, status="failed",
-                                     error=f"Rate limited{' — resets ' + reset_info if reset_info else ''}",
+                                     error=f"skipped: {error[:200]}",
                                      finished_at=now_iso())
-                    self._stats["failed"] += 1
-                    print(f"  Agent {agent_id}: rate limited on {model_tier['label']}"
-                          f"{' — resets ' + reset_info if reset_info else ''}")
+                    self._stats["skipped"] = self._stats.get("skipped", 0) + 1
+                    print(f"  Agent {agent_id}: skipped — {error[:80]}", flush=True)
+                    self._tier_distributor.clear_saturation(model_tier["model"])
                 else:
                     update_agent_run(conn, agent_id, status="failed",
-                                     error=error_msg, finished_at=now_iso())
+                                     error=error[:500],
+                                     error_class=error_info["class"],
+                                     finished_at=now_iso())
                     self._stats["failed"] += 1
-                    print(f"  Agent {agent_id}: failed — {error_msg[:80]}")
+                    print(f"  Agent {agent_id}: failed [{error_info['class']}] — {error[:80]}",
+                          flush=True)
+                    await self._diagnose_and_react(error_info, agent_id, issue)
 
+        except FactoryHaltedError:
+            raise
         except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            error_info = self._classify_error(str(e), tb, 1)
             update_agent_run(conn, agent_id, status="failed",
-                             error=str(e)[:500], finished_at=now_iso())
+                             error=str(e)[:500],
+                             error_class=error_info["class"],
+                             finished_at=now_iso())
             self._stats["failed"] += 1
-            print(f"  Agent {agent_id}: error — {e}")
+            print(f"  Agent {agent_id}: exception [{error_info['class']}] — {e}", flush=True)
+            print(f"  Traceback:\n{tb[-500:]}", flush=True)
+            await self._diagnose_and_react(error_info, agent_id, issue)
 
         finally:
-            if is_christian:
-                self._christian_agent_active = False
             self._tier_distributor.release_agent(agent_id)
             await release_claim(self.pool, issue["id"], agent_id, "completed")
             cleanup_agent_work_dir(agent_id)
             self._active_agents.pop(agent_id, None)
             self._write_status()
-            self._semaphore.release()
 
-    async def _run_feedback_subprocess(self, agent_id: str, contribution: dict,
-                                        model_tier: dict):
-        """Run a feedback-revision agent as a subprocess calling `dogood solve-feedback`."""
+    async def _run_feedback_inline(self, agent_id: str, contribution: dict,
+                                    model_tier: dict):
+        """Run solver.solve_feedback() directly in this process. No subprocess."""
+        from src.solver import Solver
         conn = self.pool.get()
-        python = sys.executable
         contribution_id = contribution["id"]
 
         try:
-            cmd = [
-                python, "-m", "src.cli", "solve-feedback",
-                "--contribution-id", str(contribution_id),
-                "--agent-id", agent_id,
-                "--model-tier", json.dumps(model_tier),
-            ]
-
-            env = os.environ.copy()
-            for key in list(env):
-                if "CLAUDE" in key.upper():
-                    env.pop(key)
-
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=str(PROJECT_ROOT),
-                env=env,
+            solver = Solver(
+                agent_id=agent_id,
+                model_tier=model_tier,
             )
+            result = await solver.solve_feedback(contribution_id)
 
-            stdout, stderr = await proc.communicate()
-            stdout_text = stdout.decode() if stdout else ""
-            stderr_text = stderr.decode() if stderr else ""
-            combined = (stdout_text + "\n" + stderr_text).strip()
-
-            if proc.returncode == 0:
+            if result.get("success"):
                 update_agent_run(conn, agent_id, status="pr_created",
                                  pr_url=contribution.get("pr_url", ""),
                                  finished_at=now_iso())
                 self._stats["succeeded"] += 1
-                print(f"  Agent {agent_id}: feedback addressed — {contribution.get('pr_url', '')}")
+                self._consecutive_failures = 0
+                self._consecutive_error_class = None
+                print(f"  Agent {agent_id}: feedback addressed — {contribution.get('pr_url', '')}",
+                      flush=True)
+
+                # Feedback addressed logged but not sent to Telegram (CEO only wants actionable alerts)
 
                 self.log_writer.append_entry(
                     f"## {datetime.now().strftime('%Y-%m-%d %H:%M')} — FEEDBACK ADDRESSED\n"
@@ -657,31 +845,60 @@ class AgentFactory:
                     f"---"
                 )
             else:
-                error_msg = combined[-500:] if combined else f"exit code {proc.returncode}"
-                update_agent_run(conn, agent_id, status="failed",
-                                 error=error_msg[:500], finished_at=now_iso())
-                self._stats["failed"] += 1
-                print(f"  Agent {agent_id}: feedback fix failed — {error_msg[:120]}")
-                # Track retry count — skip after 3 failures to avoid infinite loops
-                retry_key = f"feedback_retries_{contribution_id}"
-                self._stats[retry_key] = self._stats.get(retry_key, 0) + 1
-                if self._stats[retry_key] >= 3:
-                    update_feedback_status(conn, contribution_id, "skipped")
-                    print(f"  Skipping contribution #{contribution_id} after {self._stats[retry_key]} failed attempts")
-                else:
-                    update_feedback_status(conn, contribution_id, "needs_revision")
+                error = result.get("error") or "Unknown error"
+                error_info = self._classify_error(error)
 
+                update_agent_run(conn, agent_id, status="failed",
+                                 error=error[:500],
+                                 error_class=error_info["class"],
+                                 finished_at=now_iso())
+                self._stats["failed"] += 1
+                print(f"  Agent {agent_id}: feedback fix failed [{error_info['class']}] — {error[:120]}",
+                      flush=True)
+
+                # Permanent failures — don't retry
+                permanent_patterns = ["pr is closed", "not open", "merged",
+                                      "anti-ai", "repo not found", "archived"]
+                is_permanent = any(pat in error.lower() for pat in permanent_patterns)
+                if is_permanent:
+                    update_feedback_status(conn, contribution_id, "skipped")
+                    print(f"  Permanently skipping contribution #{contribution_id}: {error[:80]}")
+                else:
+                    retry_key = f"feedback_retries_{contribution_id}"
+                    self._stats[retry_key] = self._stats.get(retry_key, 0) + 1
+                    if self._stats[retry_key] >= 3:
+                        update_feedback_status(conn, contribution_id, "skipped")
+                        print(f"  Skipping contribution #{contribution_id} after {self._stats[retry_key]} failed attempts")
+                    else:
+                        update_feedback_status(conn, contribution_id, "needs_revision")
+
+                issue_info = {
+                    "full_name": contribution.get("full_name", "?"),
+                    "number": contribution.get("pr_url", "feedback").split("/")[-1] if contribution.get("pr_url") else "?",
+                }
+                await self._diagnose_and_react(error_info, agent_id, issue_info)
+
+        except FactoryHaltedError:
+            raise
         except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            error_info = self._classify_error(str(e), tb, 1)
             update_agent_run(conn, agent_id, status="failed",
-                             error=str(e)[:500], finished_at=now_iso())
+                             error=str(e)[:500],
+                             error_class=error_info["class"],
+                             finished_at=now_iso())
             self._stats["failed"] += 1
-            print(f"  Agent {agent_id}: feedback error — {e}")
-            # Reset to needs_revision so it gets retried
+            print(f"  Agent {agent_id}: feedback error [{error_info['class']}] — {e}", flush=True)
             update_feedback_status(conn, contribution_id, "needs_revision")
+            issue_info = {
+                "full_name": contribution.get("full_name", "?"),
+                "number": "?",
+            }
+            await self._diagnose_and_react(error_info, agent_id, issue_info)
 
         finally:
             self._tier_distributor.release_agent(agent_id)
             cleanup_agent_work_dir(agent_id)
             self._active_agents.pop(agent_id, None)
             self._write_status()
-            self._semaphore.release()

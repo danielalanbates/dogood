@@ -2,11 +2,12 @@
 
 import asyncio
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
 
-from claude_code_sdk import query, ClaudeCodeOptions as ClaudeAgentOptions, AssistantMessage, ResultMessage
+from claude_agent_sdk import query, ClaudeAgentOptions, AssistantMessage, ResultMessage
 
 import re
 
@@ -51,6 +52,10 @@ README_FILES = [
 ]
 
 
+class _SkipClaudeSDK(Exception):
+    """Solver ran on a non-Claude agent; go straight to the change check."""
+
+
 class Solver:
     def __init__(self, token: str = GITHUB_TOKEN, username: str = GITHUB_USERNAME,
                  agent_id: str = "main", work_dir: Path = WORK_DIR,
@@ -61,6 +66,128 @@ class Solver:
         self.work_dir = work_dir
         self.model_tier = model_tier  # None = use defaults (backward compatible)
         self.is_bounty = is_bounty
+
+    def score_issue_quality(self, issue: dict) -> tuple[float, list[str]]:
+        """Score issue quality/actionability from 0.0 (skip) to 1.0 (ideal).
+
+        Returns (score, reasons). Issues below 0.3 should be skipped.
+        Focuses on whether the issue is concrete enough to produce code changes.
+        """
+        reasons = []
+        score = 0.5  # base
+
+        body = issue.get("body") or ""
+        title = issue.get("title") or ""
+        labels_raw = issue.get("labels") or "[]"
+        if isinstance(labels_raw, str):
+            try:
+                labels = {l.lower() for l in json.loads(labels_raw)}
+            except (json.JSONDecodeError, TypeError):
+                labels = set()
+        else:
+            labels = {l.lower() for l in labels_raw}
+
+        # --- Positive signals ---
+        # Bug label = clear actionable problem
+        if "bug" in labels:
+            score += 0.15
+            reasons.append("+0.15 bug label")
+
+        # Body has code/error references (concrete problem)
+        if "```" in body or "traceback" in body.lower() or "error" in body.lower():
+            score += 0.10
+            reasons.append("+0.10 code/error in body")
+
+        # Body has file path references (points to specific code)
+        if re.search(r'[\w/]+\.\w{1,6}\b', body):
+            score += 0.10
+            reasons.append("+0.10 file paths in body")
+
+        # Steps to reproduce present
+        if re.search(r'(steps? to reproduce|how to reproduce|reproduction|repro)', body.lower()):
+            score += 0.10
+            reasons.append("+0.10 steps to reproduce")
+
+        # Sufficient body length
+        if len(body) >= 200:
+            score += 0.05
+            reasons.append("+0.05 good body length")
+        elif len(body) < 50:
+            score -= 0.20
+            reasons.append("-0.20 very short body")
+
+        # --- Negative signals ---
+        # Feature requests are harder to produce working code for
+        feature_labels = {"enhancement", "feature", "feature-request", "feature request",
+                          "improvement", "idea", "suggestion", "wishlist"}
+        if labels & feature_labels:
+            score -= 0.25
+            reasons.append("-0.25 feature/enhancement label")
+
+        # Question/discussion = not actionable code change
+        skip_labels = {"discussion", "question", "wontfix", "duplicate",
+                       "invalid", "meta", "proposal", "rfc", "epic"}
+        if labels & skip_labels:
+            score -= 0.40
+            reasons.append("-0.40 non-actionable label")
+
+        # Title signals a discussion, not a bug
+        discussion_patterns = ["how to", "how do i", "is it possible", "can we",
+                               "should we", "what is", "why does", "anyone know",
+                               "help:", "support:"]
+        title_lower = title.lower()
+        if any(pat in title_lower for pat in discussion_patterns):
+            score -= 0.15
+            reasons.append("-0.15 discussion-style title")
+
+        # Body is mostly a question
+        if body.count("?") >= 3 and len(body) < 500:
+            score -= 0.10
+            reasons.append("-0.10 question-heavy body")
+
+        score = round(max(0.0, min(1.0, score)), 2)
+        return score, reasons
+
+    def _gather_related_files(self, clone_path: Path, issue: dict) -> str:
+        """Scan the issue body for file references and read them for context.
+
+        Returns a string with relevant file contents to inject into the prompt.
+        """
+        body = issue.get("body") or ""
+        title = issue.get("title") or ""
+        text = f"{title}\n{body}"
+
+        # Extract file paths from the issue
+        file_refs = re.findall(r'(?:^|\s|`)([\w./\\-]+\.(?:py|js|ts|jsx|tsx|css|html|yml|yaml|json|sh|vue|svelte))\b', text)
+        # Deduplicate and limit
+        seen = set()
+        unique_refs = []
+        for ref in file_refs:
+            ref_clean = ref.lstrip("./")
+            if ref_clean not in seen:
+                seen.add(ref_clean)
+                unique_refs.append(ref_clean)
+        unique_refs = unique_refs[:5]  # max 5 files
+
+        if not unique_refs:
+            return ""
+
+        context_parts = []
+        for ref in unique_refs:
+            fp = clone_path / ref
+            if fp.exists() and fp.is_file():
+                try:
+                    content = fp.read_text(errors="replace")
+                    # Cap each file at 3000 chars
+                    if len(content) > 3000:
+                        content = content[:3000] + "\n... (truncated)"
+                    context_parts.append(f"### File: {ref}\n```\n{content}\n```")
+                except Exception:
+                    pass
+
+        if context_parts:
+            return "\n\n## Related Source Files (referenced in issue):\n" + "\n\n".join(context_parts)
+        return ""
 
     def _signal_rate_limit(self, model: str):
         """Signal the orchestrator which model hit a rate limit."""
@@ -90,6 +217,7 @@ class Solver:
 
         if not issue:
             raise ValueError(f"Issue {issue_id} not found in database")
+        issue = dict(issue)  # Convert sqlite3.Row to dict for .get() support
 
         owner = issue["owner"]
         repo_name = issue["repo_name"]
@@ -97,6 +225,30 @@ class Solver:
         full_name = issue["full_name"]
 
         print(f"Solving {full_name}#{issue_number}: {issue['title']}")
+
+        # Pre-flight: skip clearly non-code issues (questions, discussions)
+        if self._is_non_code_issue(issue):
+            print(f"  Skipping: non-code issue (question/discussion/support)")
+            record_contribution(conn, {
+                "issue_id": issue_id, "repo_id": issue["repo_id"],
+                "action": "skipped", "status": "skipped_low_quality",
+            })
+            return {"success": False, "error": "Non-code issue (question/discussion)"}
+
+        # Pre-flight: issue quality scoring — skip vague/non-actionable issues
+        quality_score, quality_reasons = self.score_issue_quality(issue)
+        print(f"  Issue quality: {quality_score:.0%}")
+        for reason in quality_reasons:
+            print(f"    {reason}")
+        if quality_score < 0.30:
+            print(f"  Skipping: issue quality too low ({quality_score:.0%} < 30%)")
+            record_contribution(conn, {
+                "issue_id": issue_id, "repo_id": issue["repo_id"],
+                "action": "skipped", "status": "skipped_low_quality",
+            })
+            return {"success": False,
+                    "error": f"Issue quality too low ({quality_score:.0%}): "
+                             f"{'; '.join(quality_reasons)}"}
 
         # Pre-flight: check if org/repo is manually blocked
         from src.config import BLOCKED_ORGS, BLOCKED_REPOS
@@ -107,6 +259,16 @@ class Solver:
                 "action": "skipped", "status": "skipped_blocked_org",
             })
             return {"success": False, "error": f"Blocked org/repo: {full_name}"}
+
+        # Pre-flight: check if issue is a non-code question/discussion
+        if self._is_non_code_issue(issue):
+            print(f"  Skipping: issue is a question/discussion, not actionable code")
+            record_contribution(conn, {
+                "issue_id": issue_id, "repo_id": issue["repo_id"],
+                "action": "skipped", "status": "skipped_low_quality",
+            })
+            return {"success": False,
+                    "error": "Issue quality too low: non-code question/discussion"}
 
         # Pre-flight: check if the bug references only unsupported file types
         unsupported_ext = self.check_issue_language(dict(issue))
@@ -177,6 +339,22 @@ class Solver:
             if guidelines["readme_contributing"]:
                 print(f"    Found README contributing section ({len(guidelines['readme_contributing'])} chars)")
 
+            # Gather codebase structure for context
+            print("  Scanning codebase structure...")
+            codebase_structure = self._get_codebase_structure(clone_path)
+
+            # Gather related source files referenced in the issue
+            print("  Gathering related source files...")
+            related_files_context = self._gather_related_files(clone_path, issue)
+            if related_files_context:
+                print(f"    Found {related_files_context.count('### File:')} related files")
+            # Prepend codebase structure to related files context
+            if codebase_structure:
+                related_files_context = (
+                    f"\n\n## Codebase Structure:\n```\n{codebase_structure[:3000]}\n```\n"
+                    + related_files_context
+                )
+
             # Create a branch
             branch_name = f"fix/issue-{issue_number}"
             self._create_branch(clone_path, branch_name)
@@ -188,16 +366,76 @@ class Solver:
             # Run Claude Code SDK to analyze and fix
             print("  Running Claude to analyze and fix...")
             result = await self._run_claude_fix(
-                clone_path, issue, issue_context, branch_name, guidelines
+                clone_path, issue, issue_context, branch_name, guidelines,
+                related_files_context=related_files_context,
             )
 
             if result["success"]:
-                # Push and create PR
+                # --- Quality Gate: estimate merge probability before submitting ---
+                # Bounties skip the quality gate — always attempt with Opus 4.6
+                if self.is_bounty:
+                    print("  Quality gate: SKIPPED (bounty — always attempt)")
+                else:
+                    from src.model_selector import estimate_merge_probability
+                    from src.config import QUALITY_GATE_THRESHOLD
+                    repo_dict = {
+                        "id": issue.get("repo_id") or issue.get("rid"),
+                        "rid": issue.get("rid"),
+                        "stars": issue.get("stars", 0),
+                    }
+                    merge_prob, gate_reasons = estimate_merge_probability(
+                        dict(issue), repo_dict, conn
+                    )
+                    print(f"  Quality gate: {merge_prob:.0%} merge probability "
+                          f"(threshold: {QUALITY_GATE_THRESHOLD:.0%})")
+                    for reason in gate_reasons:
+                        print(f"    {reason}")
+
+                    if merge_prob < QUALITY_GATE_THRESHOLD:
+                        print(f"  BLOCKED by quality gate ({merge_prob:.0%} < {QUALITY_GATE_THRESHOLD:.0%})")
+                        update_contribution_status(conn, contrib_id, "blocked_quality_gate")
+                        return {
+                            "success": False,
+                            "error": f"Quality gate: {merge_prob:.0%} < {QUALITY_GATE_THRESHOLD:.0%} "
+                                     f"({'; '.join(gate_reasons)})",
+                        }
+
+                from src.config import AUTO_SUBMIT_MIN_CONFIDENCE
+                # Flag file lets the menu bar icon show yellow while the Reviewer works.
+                reviewing_flag = Path("/tmp/dogood-reviewing")
+                reviewing_flag.write_text(f"{owner}/{repo_name}#{issue_number}")
+                try:
+                    confidence, review_notes = self._acceptance_review(
+                        clone_path, owner, repo_name, issue, issue_context, guidelines
+                    )
+                finally:
+                    reviewing_flag.unlink(missing_ok=True)
+                submit = confidence >= AUTO_SUBMIT_MIN_CONFIDENCE
+                self._approval_context = {
+                    "contribution_id": contrib_id,
+                    "confidence": confidence,
+                    "review": review_notes,
+                    "propose": submit,
+                }
+                print(f"  Acceptance review: {confidence:.0%} "
+                      f"(threshold {AUTO_SUBMIT_MIN_CONFIDENCE:.0%}) — "
+                      f"{'asking Daniel via Telegram' if submit else 'below threshold, not proposed'}")
+                if review_notes:
+                    print(f"    {review_notes[:400]}")
+
                 print("  Creating pull request...")
                 pr_url = self._push_and_pr(
                     clone_path, owner, repo_name,
-                    issue_number, issue["title"], branch_name, guidelines
+                    issue_number, issue["title"], branch_name, guidelines,
                 )
+                if pr_url == "PENDING_APPROVAL":
+                    update_contribution_status(conn, contrib_id, "pending_approval")
+                    return {
+                        "success": False,
+                        "pending_approval": True,
+                        "error": "pending human approval: PR prepared locally and "
+                                 "queued in data/pending_prs.jsonl (not posted)",
+                    }
                 # Track model used and opus attempts
                 model_used = None
                 opus_attempts = 0
@@ -212,9 +450,12 @@ class Solver:
                 return {"success": True, "pr_url": pr_url, "details": result}
             else:
                 update_contribution_status(conn, contrib_id, "failed")
-                return {"success": False, "error": result.get("error")}
+                return {"success": False, "error": result.get("error") or "No changes produced by Claude"}
 
         except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            print(f"  solve_issue error: {e}\n{tb}", flush=True)
             update_contribution_status(conn, contrib_id, "error")
             return {"success": False, "error": str(e)}
 
@@ -580,21 +821,122 @@ class Solver:
         )
 
     def _fetch_issue_context(self, owner: str, repo: str, number: int) -> str:
-        """Fetch issue body + comments via gh CLI."""
+        """Fetch issue body + comments via gh CLI with rich formatting.
+
+        Parses the JSON and formats comments into a readable thread so the
+        model gets full discussion context instead of raw JSON.
+        """
         result = subprocess.run(
             ["gh", "issue", "view", str(number),
              "--repo", f"{owner}/{repo}",
              "--json", "title,body,comments,labels,assignees"],
             capture_output=True, text=True, timeout=30
         )
-        if result.returncode == 0:
+        if result.returncode != 0:
+            return "{}"
+
+        try:
+            data = json.loads(result.stdout)
+        except (json.JSONDecodeError, TypeError):
             return result.stdout
-        return "{}"
+
+        parts = []
+        parts.append(f"Title: {data.get('title', '')}")
+        labels = data.get("labels", [])
+        if labels:
+            label_names = [l.get("name", str(l)) if isinstance(l, dict) else str(l) for l in labels]
+            parts.append(f"Labels: {', '.join(label_names)}")
+        body = data.get("body") or ""
+        if body:
+            parts.append(f"\n### Issue Body:\n{body[:10000]}")
+        comments = data.get("comments", [])
+        if comments:
+            parts.append(f"\n### Comments ({len(comments)}):")
+            for c in comments[:15]:
+                author = c.get("author", {}).get("login", "unknown") if isinstance(c.get("author"), dict) else "unknown"
+                cbody = c.get("body", "")[:2000]
+                parts.append(f"\n**@{author}:**\n{cbody}")
+        return "\n".join(parts)
+
+    def _get_codebase_structure(self, clone_path: Path) -> str:
+        """Get a tree view of the codebase for pre-analysis context.
+
+        Returns a file listing (max depth 3) excluding common noise dirs.
+        For large repos (>200 files), returns just the directory structure.
+        """
+        try:
+            result = subprocess.run(
+                ["find", ".", "-maxdepth", "3", "-type", "f",
+                 "-not", "-path", "./.git/*",
+                 "-not", "-path", "./node_modules/*",
+                 "-not", "-path", "./.venv/*",
+                 "-not", "-path", "./vendor/*",
+                 "-not", "-path", "./__pycache__/*",
+                 "-not", "-path", "./dist/*",
+                 "-not", "-path", "./build/*",
+                 "-not", "-name", "*.pyc",
+                 "-not", "-name", "*.min.js",
+                 "-not", "-name", "*.map"],
+                capture_output=True, text=True, timeout=10,
+                cwd=str(clone_path)
+            )
+            if result.returncode == 0:
+                files = result.stdout.strip().split("\n")
+                if len(files) > 200:
+                    dir_result = subprocess.run(
+                        ["find", ".", "-maxdepth", "2", "-type", "d",
+                         "-not", "-path", "./.git/*",
+                         "-not", "-path", "./node_modules/*"],
+                        capture_output=True, text=True, timeout=10,
+                        cwd=str(clone_path)
+                    )
+                    return f"Large repo ({len(files)} files). Directory structure:\n{dir_result.stdout[:3000]}"
+                return "\n".join(files[:200])
+        except Exception:
+            pass
+        return "Could not read codebase structure"
+
+    def _is_non_code_issue(self, issue: dict) -> bool:
+        """Check if issue is clearly non-code (question, discussion, docs-only).
+
+        Returns True if the issue should be skipped because it will not
+        produce code changes.
+        """
+        title = (issue.get("title") or "").lower()
+        body = (issue.get("body") or "").lower()
+        combined = f"{title} {body[:500]}"
+
+        labels_raw = issue.get("labels") or "[]"
+        if isinstance(labels_raw, str):
+            try:
+                labels = {l.lower() for l in json.loads(labels_raw)}
+            except (json.JSONDecodeError, TypeError):
+                labels = set()
+        else:
+            labels = {l.lower() for l in labels_raw}
+
+        question_labels = {"question", "discussion", "support", "wontfix",
+                           "invalid", "duplicate", "stale", "needs-info",
+                           "needs-more-info", "waiting-for-response"}
+        if labels & question_labels:
+            return True
+
+        question_patterns = [
+            "how to ", "how do i ", "is it possible", "can i ",
+            "what is the ", "why does ", "why is ", "does anyone know",
+            "help needed", "question:", "[question]", "asking for help",
+        ]
+        for pat in question_patterns:
+            if pat in combined:
+                return True
+
+        return False
 
     async def _run_claude_fix(
         self, clone_path: Path, issue: dict,
         issue_context: str, branch_name: str,
-        guidelines: dict | None = None
+        guidelines: dict | None = None,
+        related_files_context: str = "",
     ) -> dict:
         """Use Claude Code SDK to analyze the issue and generate a fix."""
 
@@ -634,14 +976,20 @@ class Solver:
 
 ## Contributing Guidelines
 {guidelines_section if guidelines_section else "No specific contributing guidelines found. Follow standard open-source practices."}
+{related_files_context}
 
 ## Your Task:
-1. Read the relevant source code to understand the codebase structure
-2. Understand the bug or feature request described in the issue
-3. Implement a minimal, focused fix that addresses the issue
-4. Make sure the fix follows the project's existing code style AND the contributing guidelines above
-5. If there are tests, run them to verify your fix doesn't break anything
-6. Stage and commit your changes with a commit message that follows the project's conventions
+1. FIRST: Read the relevant source code to understand the codebase structure and the area of code related to this issue. Use Grep and Glob to explore. Read at least 2-3 files related to the issue before making any changes.
+2. Understand the bug or problem described in the issue. Identify the ROOT CAUSE, not just the symptom.
+3. BEFORE writing any code: verify you understand where the bug lives and what the fix should be. If the issue is too vague, ambiguous, or would require extensive new feature development, STOP and explain why — do NOT attempt a speculative fix.
+4. Implement a minimal, focused fix that addresses the issue
+5. Make sure the fix follows the project's existing code style AND the contributing guidelines above
+6. VALIDATION: After making changes, verify your fix is correct:
+   - Re-read the modified files to confirm the changes are syntactically correct
+   - If there are tests, run them to verify your fix doesn't break anything
+   - Check that your changes actually address the issue described (not just something tangentially related)
+   - If you cannot verify the fix addresses the issue, do NOT commit
+7. Stage and commit your changes with a commit message that follows the project's conventions
    - If the project specifies a commit format (e.g., Conventional Commits, type: description), USE IT
    - Otherwise use: "Fix #{issue['number']}: <brief description>"
 
@@ -651,7 +999,8 @@ CRITICAL guidelines:
 - Do NOT modify unrelated files
 - Follow the project's commit message format exactly
 - If the project requires signed-off-by, DCO, or other sign-off, include it
-- If the issue is too complex or ambiguous, explain why and stop
+- If the issue is too complex, ambiguous, or is a feature request without clear specs, explain why and STOP without committing
+- You MUST make actual code changes that address the issue. Reading files alone is not enough. If you cannot determine a concrete fix, do not commit.
 """
 
         # Build options — Bounty Agent gets a quality-focused prompt and more turns
@@ -671,9 +1020,21 @@ CRITICAL guidelines:
             system_prompt = (
                 "You are a skilled open-source contributor. You fix bugs carefully, "
                 "write clean code, and follow project conventions. You are thorough "
-                "but minimal in your changes."
+                "but minimal in your changes. "
+                "IMPORTANT: Always read the relevant source files BEFORE making any changes. "
+                "Understand the codebase structure and the root cause of the bug. "
+                "If you cannot identify a concrete fix, do NOT commit empty or speculative changes. "
+                "After making changes, re-read the modified files to verify correctness."
             )
-            max_turns = 30
+            max_turns = 40
+
+        # Capture claude CLI stderr for debugging
+        stderr_lines = []
+        stderr_buffer = []
+        def _stderr_cb(line: str):
+            stderr_lines.append(line)
+            stderr_buffer.append(line)
+            if len(stderr_buffer) > 50: stderr_buffer.pop(0)
 
         opts_kwargs = {
             "system_prompt": system_prompt,
@@ -681,14 +1042,15 @@ CRITICAL guidelines:
             "cwd": str(clone_path),
             "max_turns": max_turns,
             "permission_mode": "bypassPermissions",
+            "stderr": _stderr_cb,
+            "max_buffer_size": 5 * 1024 * 1024,  # 5MB buffer to avoid JSON overflow
         }
         if self.model_tier:
             opts_kwargs["model"] = self.model_tier["model"]
-            extra = {}
             if self.model_tier.get("effort"):
-                extra["effort"] = self.model_tier["effort"]
-            if extra:
-                opts_kwargs["extra_args"] = extra
+                opts_kwargs["effort"] = self.model_tier["effort"]
+            if self.model_tier.get("thinking"):
+                opts_kwargs["thinking"] = {"type": "enabled", "budget_tokens": 10000}
         options = ClaudeAgentOptions(**opts_kwargs)
 
         result_text = ""
@@ -696,12 +1058,11 @@ CRITICAL guidelines:
         cost_usd = 0.0
 
         try:
-            # Ensure no Claude Code env vars that would trigger "nested session" detection
-            import os as _os
-            for _k in list(_os.environ):
-                if "CLAUDE" in _k.upper():
-                    _os.environ.pop(_k, None)
-
+            from src.llm import provider, run_agent_in
+            if self.model_tier and provider(self.model_tier["model"]) == "agy":
+                print(f"  Fixer: Antigravity {self.model_tier['model'][4:]}", flush=True)
+                result_text = run_agent_in(clone_path, prompt, system_prompt)
+                raise _SkipClaudeSDK()
             from src.rate_coordinator import (
                 report_rate_limit, get_retry_delay, get_slot_for_agent,
             )
@@ -727,7 +1088,39 @@ CRITICAL guidelines:
                     break  # Success — exit retry loop
                 except Exception as e:
                     err_str = str(e).lower()
-                    if ("rate_limit" in err_str or "hit your limit" in err_str):
+                    stderr_tail = "\n".join(stderr_buffer[-20:]) if stderr_buffer else ""
+                    # Log stderr for debugging on any error
+                    if stderr_tail:
+                        print(f"  Claude CLI stderr (last 10 lines):", flush=True)
+                        for sl in stderr_buffer[-10:]:
+                            print(f"    {sl}", flush=True)
+
+                    # Check if result_text already captured a meaningful error
+                    # from the SDK stream before the ProcessError was raised.
+                    # The SDK sends result messages (billing, auth errors) THEN
+                    # exits with code 1, causing ProcessError to mask the real
+                    # error. Detect these and fail immediately — no retry.
+                    result_lower = result_text.lower()
+                    billing_patterns = ["credit balance", "balance is too low",
+                                        "billing_error", "payment required",
+                                        "insufficient_quota"]
+                    auth_patterns_result = ["invalid api key", "unauthorized",
+                                            "authentication_error",
+                                            "api key is invalid"]
+
+                    if any(p in result_lower for p in billing_patterns):
+                        raise Exception(
+                            f"billing_error: {result_text.strip()[:300]}"
+                        ) from e
+
+                    if any(p in result_lower for p in auth_patterns_result):
+                        raise Exception(
+                            f"auth_error: {result_text.strip()[:300]}"
+                        ) from e
+
+                    if ("rate_limit" in err_str or "hit your limit" in err_str
+                            or any(p in result_lower for p in ["rate_limit", "rate limit", "hit your limit"])
+                            or (stderr_tail and ("rate limit" in stderr_tail.lower() or "hit your limit" in stderr_tail.lower()))):
                         if attempt < max_retries:
                             # Report to shared coordinator so other agents stagger
                             report_rate_limit(self.agent_id)
@@ -744,9 +1137,10 @@ CRITICAL guidelines:
                                     self.model_tier = current_tier
                                     escalated_kwargs = {**opts_kwargs}
                                     escalated_kwargs["model"] = current_tier["model"]
-                                    escalated_kwargs["extra_args"] = {
-                                        "effort": current_tier.get("effort", "medium")
-                                    }
+                                    if current_tier.get("effort"):
+                                        escalated_kwargs["effort"] = current_tier["effort"]
+                                    if current_tier.get("thinking"):
+                                        escalated_kwargs["thinking"] = {"type": "enabled", "budget_tokens": 10000}
                                     options = ClaudeAgentOptions(**escalated_kwargs)
                                     print(f"  Rate limited on {hit_model} — "
                                           f"escalating to {current_tier['label']}",
@@ -760,8 +1154,29 @@ CRITICAL guidelines:
                                   flush=True)
                             await asyncio.sleep(wait)
                             continue
-                    raise  # Re-raise non-rate-limit errors or last attempt
 
+                    # Retry generic SDK errors (exit code 1) up to 2 times
+                    if ("exit code 1" in err_str or "command failed" in err_str):
+                        if attempt < min(max_retries, 2):
+                            wait = 10 * (attempt + 1)
+                            print(f"  SDK error (attempt {attempt + 1}): {e} — retrying in {wait}s...",
+                                  flush=True)
+                            await asyncio.sleep(wait)
+                            continue
+
+                    if "check stderr output" in err_str and stderr_tail:
+                        raise Exception(f"Claude CLI error: {stderr_tail.strip()}") from e
+
+                    raise  # Re-raise non-retryable errors or last attempt
+
+        except _SkipClaudeSDK:
+            pass
+        except Exception as e:
+            import traceback
+            print(f"  Solver error: {e}\n{traceback.format_exc()}", flush=True)
+            return {"success": False, "error": str(e)}
+
+        try:
             # Check if there are actual changes
             diff_result = subprocess.run(
                 ["git", "-C", str(clone_path), "diff", "--stat", "HEAD~1"],
@@ -791,12 +1206,36 @@ CRITICAL guidelines:
             success = has_changes
 
         except Exception as e:
-            return {"success": False, "error": str(e)}
+            import traceback
+            tb = traceback.format_exc()
+            stderr_tail = "\n".join(stderr_lines[-20:]) if stderr_lines else ""
+            print(f"  Solver error: {e}\n{tb}", flush=True)
+            if stderr_tail:
+                print(f"  Claude CLI stderr:\n{stderr_tail}", flush=True)
+            # Include stderr context in the error for better diagnosis upstream
+            error_msg = str(e)
+            if stderr_tail:
+                error_msg += f"\nStderr: {stderr_tail[-300:]}"
+            return {"success": False, "error": error_msg}
+
+        if not success:
+            # No git changes produced — include stderr context if available
+            stderr_tail = "\n".join(stderr_lines[-10:]) if stderr_lines else ""
+            error_detail = "No changes produced by Claude"
+            if stderr_tail:
+                error_detail += f" (stderr: {stderr_tail[-200:]})"
+            return {
+                "success": False,
+                "error": error_detail,
+                "result": result_text[-2000:] if result_text else "No output",
+                "has_changes": False,
+                "cost_usd": cost_usd,
+            }
 
         return {
-            "success": success,
+            "success": True,
             "result": result_text[-2000:] if result_text else "No output",
-            "has_changes": success,
+            "has_changes": True,
             "cost_usd": cost_usd,
         }
 
@@ -834,18 +1273,63 @@ CRITICAL guidelines:
         except Exception:
             return "main"
 
+    def _acceptance_review(
+        self, clone_path: Path, owner: str, repo: str, issue: dict,
+        issue_context: str, guidelines: dict | None,
+    ) -> tuple[float, str]:
+        """Independent Fable review of the finished diff. Returns (0..1 confidence, notes).
+
+        Any failure (model limit, unparseable output) scores 0 so nothing is posted.
+        """
+        diff = subprocess.run(
+            ["git", "-C", str(clone_path), "diff", "origin/HEAD...HEAD"],
+            capture_output=True, text=True, timeout=30,
+        ).stdout
+        if not diff.strip():
+            diff = subprocess.run(
+                ["git", "-C", str(clone_path), "diff", "HEAD"],
+                capture_output=True, text=True, timeout=30,
+            ).stdout
+        if not diff.strip():
+            return 0.0, "empty diff"
+        guidelines = guidelines or {}
+        prompt = (
+            "You are a strict open-source maintainer deciding whether to MERGE a pull request.\n"
+            f"Repository: {owner}/{repo}\nIssue #{issue.get('issue_number') or issue.get('number')}: "
+            f"{issue.get('title', '')}\n\nIssue context:\n{(issue_context or '')[:6000]}\n\n"
+            f"CONTRIBUTING:\n{(guidelines.get('contributing') or '')[:3000]}\n\n"
+            f"Proposed diff:\n```diff\n{diff[:20000]}\n```\n\n"
+            "Estimate the probability this PR is merged as-is: fully fixes the issue, minimal, "
+            "correct, follows conventions, no unrelated changes, no one else already fixing it. "
+            "Be conservative. Reply with ONLY JSON: "
+            '{"confidence": <integer 0-100>, "reason": "<one sentence>"}'
+        )
+        from src.llm import complete
+        try:
+            out = complete("reviewer", prompt, timeout=600)
+            m = re.search(r'\{[^{}]*"confidence"[^{}]*\}', out)
+            if not m:
+                return 0.0, f"review unparseable: {out.strip()[:200]}"
+            data = json.loads(m.group(0))
+            return max(0.0, min(1.0, float(data["confidence"]) / 100.0)), str(data.get("reason", ""))
+        except Exception as e:
+            return 0.0, f"review failed: {e}"
+
     def _push_and_pr(
         self, clone_path: Path, upstream_owner: str, repo: str,
         issue_number: int, issue_title: str, branch_name: str,
-        guidelines: dict | None = None
+        guidelines: dict | None = None,
     ) -> str:
-        """Push the branch and create a PR, respecting project conventions."""
+        """Prepare the PR; it is queued for Daniel's Telegram approval, never posted directly."""
         guidelines = guidelines or {}
 
-        subprocess.run(
-            ["git", "-C", str(clone_path), "push", "-u", "origin", branch_name],
-            check=True, capture_output=True, text=True, timeout=60
-        )
+        REQUIRE_HUMAN_APPROVAL = True
+
+        if not REQUIRE_HUMAN_APPROVAL:
+            subprocess.run(
+                ["git", "-C", str(clone_path), "push", "-u", "origin", branch_name],
+                check=True, capture_output=True, text=True, timeout=60
+            )
 
         # Get the diff summary for the PR body
         diff_stat = subprocess.run(
@@ -915,6 +1399,12 @@ CRITICAL guidelines:
         base_branch = self._detect_base_branch(upstream_owner, repo)
         print(f"  PR target: {upstream_owner}/{repo} base={base_branch}")
 
+        if REQUIRE_HUMAN_APPROVAL:
+            return self._queue_pending_pr(
+                clone_path, upstream_owner, repo, issue_number,
+                branch_name, base_branch, pr_title, pr_body
+            )
+
         result = subprocess.run(
             ["gh", "pr", "create",
              "--repo", f"{upstream_owner}/{repo}",
@@ -929,6 +1419,59 @@ CRITICAL guidelines:
             raise RuntimeError(f"PR creation failed: {result.stderr}")
 
         return result.stdout.strip()
+
+    def _queue_pending_pr(
+        self, clone_path: Path, upstream_owner: str, repo: str,
+        issue_number: int, branch_name: str, base_branch: str,
+        pr_title: str, pr_body: str,
+    ) -> str:
+        """Human approval gate: queue the prepared PR locally instead of posting it.
+
+        The branch and commits exist only in the local clone. To approve, run the
+        recorded push_cmd then pr_create_cmd (or use `dogood` tooling).
+        """
+        from src.config import PENDING_PR_QUEUE
+        entry = {
+            "queued_at": now_iso(),
+            "repo": f"{upstream_owner}/{repo}",
+            "issue_number": issue_number,
+            "branch": branch_name,
+            "base": base_branch,
+            "clone_path": str(clone_path),
+            "title": pr_title,
+            "body": pr_body,
+            "push_cmd": ["git", "-C", str(clone_path), "push", "-u", "origin", branch_name],
+            "pr_create_cmd": ["gh", "pr", "create",
+                              "--repo", f"{upstream_owner}/{repo}",
+                              "--head", f"{self.username}:{branch_name}",
+                              "--base", base_branch,
+                              "--title", pr_title,
+                              "--body", pr_body],
+        }
+        PENDING_PR_QUEUE.parent.mkdir(parents=True, exist_ok=True)
+        with open(PENDING_PR_QUEUE, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+
+        from src import approvals
+        ctx = getattr(self, "_approval_context", None) or {}
+        confidence = ctx.get("confidence")
+        summary = (
+            f"PR to {upstream_owner}/{repo} for issue #{issue_number}\n"
+            f"{pr_title}\n"
+            f"https://github.com/{upstream_owner}/{repo}/issues/{issue_number}\n"
+            + (f"Reviewer confidence: {confidence:.0%} — {ctx.get('review', '')[:300]}" if confidence is not None else "")
+        )
+        approvals.request(
+            "pull request", summary, [entry["push_cmd"], entry["pr_create_cmd"]],
+            meta={"contribution_id": ctx.get("contribution_id"), "repo": entry["repo"],
+                  "issue_number": issue_number, "confidence": confidence},
+            ask=bool(ctx.get("propose")),
+        )
+        self._approval_context = None
+        print(f"  [APPROVAL GATE] PR NOT posted. Recorded (sent to Daniel only if review passed): "
+              f"{upstream_owner}/{repo}#{issue_number} branch={branch_name} "
+              f"-> {PENDING_PR_QUEUE}", flush=True)
+        return "PENDING_APPROVAL"
 
     async def solve_feedback(self, contribution_id: int) -> dict:
         """Re-work a PR based on reviewer feedback. Updates the existing branch/PR."""
@@ -1025,12 +1568,7 @@ CRITICAL guidelines:
             )
 
             if result["success"]:
-                # Push updates to the same branch (auto-updates the PR)
-                print("  Pushing updates...")
-                subprocess.run(
-                    ["git", "-C", str(clone_path), "push", "origin", branch_name],
-                    check=True, capture_output=True, text=True, timeout=60
-                )
+                push_cmd = ["git", "-C", str(clone_path), "push", "origin", branch_name]
 
                 # Thank the reviewer in their language
                 from src.feedback import _detect_language
@@ -1047,11 +1585,15 @@ CRITICAL guidelines:
                     "fr": f"Merci pour le retour, @{feedback_reviewer} ! J'ai poussé une mise à jour avec les modifications demandées. N'hésitez pas à revérifier.",
                 }
                 thank_msg = _thank_translations.get(reviewer_lang, _thank_translations["en"])
-                subprocess.run(
-                    ["gh", "pr", "comment", pr_number,
-                     "--repo", f"{owner}/{repo_name}", "--body", thank_msg],
-                    capture_output=True, text=True, timeout=15
+                from src import approvals
+                approvals.request(
+                    "review revision",
+                    f"Push fixes for @{feedback_reviewer}'s review on {pr_url} and reply:\n\"{thank_msg}\"",
+                    [push_cmd, ["gh", "pr", "comment", pr_number,
+                                "--repo", f"{owner}/{repo_name}", "--body", thank_msg]],
+                    meta={"contribution_id": contribution_id, "pr_url": pr_url},
                 )
+                print("  Revision ready — queued for Daniel's approval", flush=True)
 
                 update_feedback_status(conn, contribution_id, "addressed")
                 return {"success": True, "pr_url": pr_url}
@@ -1172,6 +1714,14 @@ CRITICAL:
 - If the reviewer asked a question, make sure the code answers it
 """
 
+        # Capture stderr for debugging
+        stderr_lines = []
+        stderr_buffer = []
+        def _stderr_cb(line: str):
+            stderr_lines.append(line)
+            stderr_buffer.append(line)
+            if len(stderr_buffer) > 50: stderr_buffer.pop(0)
+
         opts_kwargs = {
             "system_prompt": (
                 "You are addressing code review feedback on a pull request. "
@@ -1182,25 +1732,68 @@ CRITICAL:
             "cwd": str(clone_path),
             "max_turns": 30,
             "permission_mode": "bypassPermissions",
+            "stderr": _stderr_cb,
+            "max_buffer_size": 5 * 1024 * 1024,  # 5MB buffer
         }
         if self.model_tier:
             opts_kwargs["model"] = self.model_tier["model"]
             if self.model_tier.get("effort"):
-                opts_kwargs["extra_args"] = {"effort": self.model_tier["effort"]}
+                opts_kwargs["effort"] = self.model_tier["effort"]
+            if self.model_tier.get("thinking"):
+                opts_kwargs["thinking"] = {"type": "enabled", "budget_tokens": 10000}
         options = ClaudeAgentOptions(**opts_kwargs)
 
         result_text = ""
         try:
-            async for message in query(prompt=prompt, options=options):
-                if message is None:
-                    continue
-                if isinstance(message, AssistantMessage):
-                    for block in message.content:
-                        if hasattr(block, "text"):
-                            result_text += block.text + "\n"
-                elif isinstance(message, ResultMessage):
-                    if message.result:
-                        result_text += message.result + "\n"
+            # Retry loop for SDK errors (exit code 1)
+            max_retries = 2
+            for attempt in range(max_retries + 1):
+                try:
+                    async for message in query(prompt=prompt, options=options):
+                        if message is None:
+                            continue
+                        if isinstance(message, AssistantMessage):
+                            for block in message.content:
+                                if hasattr(block, "text"):
+                                    result_text += block.text + "\n"
+                        elif isinstance(message, ResultMessage):
+                            if message.result:
+                                result_text += message.result + "\n"
+                    break  # Success — exit retry loop
+                except Exception as e:
+                    err_str = str(e).lower()
+                    stderr_tail = "\n".join(stderr_buffer[-20:]) if stderr_buffer else ""
+                    if stderr_tail:
+                        print(f"  Claude CLI stderr (last 5 lines):", flush=True)
+                        for sl in stderr_lines[-5:]:
+                            print(f"    {sl}", flush=True)
+
+                    # Check result_text for billing/auth errors before retrying.
+                    # The SDK streams result messages then raises ProcessError on
+                    # exit code 1, masking the real error.
+                    result_lower = result_text.lower()
+                    billing_kw = ["credit balance", "balance is too low",
+                                  "billing_error", "payment required"]
+                    auth_kw = ["invalid api key", "unauthorized",
+                               "authentication_error"]
+                    if any(p in result_lower for p in billing_kw):
+                        raise Exception(
+                            f"billing_error: {result_text.strip()[:300]}"
+                        ) from e
+                    if any(p in result_lower for p in auth_kw):
+                        raise Exception(
+                            f"auth_error: {result_text.strip()[:300]}"
+                        ) from e
+
+                    if ("exit code 1" in err_str or "command failed" in err_str):
+                        if attempt < max_retries:
+                            wait = 10 * (attempt + 1)
+                            print(f"  SDK error (attempt {attempt + 1}): {e} — retrying in {wait}s...",
+                                  flush=True)
+                            await asyncio.sleep(wait)
+                            stderr_lines.clear()
+                            continue
+                    raise  # Non-retryable or last attempt
 
             # Check for actual changes
             diff_result = subprocess.run(
@@ -1226,7 +1819,15 @@ CRITICAL:
                     )
                     has_changes = True
 
-            return {"success": has_changes, "result": result_text[-2000:]}
+            if has_changes:
+                return {"success": True, "result": result_text[-2000:]}
+            else:
+                return {"success": False, "error": "No changes produced by Claude for feedback fix",
+                        "result": result_text[-2000:]}
 
         except Exception as e:
-            return {"success": False, "error": str(e)}
+            stderr_tail = "\n".join(stderr_lines[-10:]) if stderr_lines else ""
+            error_msg = str(e)
+            if stderr_tail:
+                error_msg += f"\nStderr: {stderr_tail[-300:]}"
+            return {"success": False, "error": error_msg}

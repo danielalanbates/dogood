@@ -149,11 +149,12 @@ class Ranker:
             repo_dict = {"language": issue["language"], "stars": issue["stars"],
                          "open_issues": issue["repo_open_issues"]}
             complexity = score_complexity(dict(issue), repo_dict)
-            tier = select_tier(complexity)
+            tier = select_tier(complexity, issue=dict(issue), repo=repo_dict)
+            tier_label = tier["label"] if tier else "skipped"
             self.conn.execute(
                 """UPDATE issues SET priority_score = ?, complexity_score = ?,
                    estimated_model = ? WHERE id = ?""",
-                (priority, complexity, tier["label"], issue["id"])
+                (priority, complexity, tier_label, issue["id"])
             )
             count += 1
         self.conn.commit()

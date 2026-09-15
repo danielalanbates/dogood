@@ -241,6 +241,14 @@ MIGRATIONS = [
             ALTER TABLE contributions ADD COLUMN mandatory_model TEXT;
         """,
     },
+    # Migration 17: Error classification for factory self-diagnosis
+    {
+        "id": 17,
+        "description": "Add error_class to agent_runs for failure classification",
+        "sql": """
+            ALTER TABLE agent_runs ADD COLUMN error_class TEXT;
+        """,
+    },
 ]
 
 

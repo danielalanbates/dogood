@@ -1,12 +1,13 @@
 """Configuration management for dogood."""
 
+import json
 import os
 import subprocess
 from pathlib import Path
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).parent.parent
-load_dotenv(PROJECT_ROOT / ".env")
+load_dotenv(PROJECT_ROOT / ".env", override=True)
 
 
 def _get_gh_token() -> str:
@@ -66,6 +67,15 @@ BEGINNER_LABELS = {
     "good first issue", "good-first-issue", "beginner",
     "easy", "first-timers-only", "starter", "low-hanging-fruit",
     "up-for-grabs",
+}
+
+# --- Non-actionable labels (skip — these aren't real bugs to fix) ---
+SKIP_LABELS = {
+    "discussion", "question", "wontfix", "won't fix", "wont-fix",
+    "duplicate", "invalid", "by design", "not a bug", "not-a-bug",
+    "stale", "needs more info", "needs-more-info", "needs-reproduction",
+    "waiting for response", "waiting-for-response", "blocked",
+    "proposal", "rfc", "meta", "epic",
 }
 
 # --- Ethics Filter ---
@@ -198,39 +208,63 @@ CLA_ORGS = {
 # Organizations where we HAVE signed the CLA
 SIGNED_CLA_ORGS = {
     "facebook", "meta", "pytorch",  # Meta CLA signed (pytorch uses Meta CLA)
+    "google", "google-gemini", "angular", "googleapis",  # Google CLA signed
+    "microsoft", "desktop", "dotnet", "azure",  # Microsoft CLA (auto-signs on PR)
+    "apache",  # Apache ICLA submitted
 }
 
-# --- Multi-Agent Factory ---
-MAX_CONCURRENT_AGENTS = int(os.getenv("MAX_CONCURRENT_AGENTS", "4"))  # 4 agents at sonnet-low
+# --- Factory (inline mode — no subprocesses) ---
+MAX_CONCURRENT_AGENTS = 1  # Always 1 — solver runs inline, not as subprocess
 AGENT_CLAIM_TTL_MINUTES = 120
 MIN_STARS_DEFAULT = 1000  # lowered from 10000
 FEEDBACK_POLL_INTERVAL_SECONDS = 300
 HOSTILE_SENTIMENT_THRESHOLD = 0.7
-MAX_OPUS_PER_ISSUE = 10  # max opus attempts per individual issue before capping at sonnet
+MAX_OPUS_PER_ISSUE = 10  # max opus attempts per individual issue before skipping
+
+# --- Quality Gate ---
+# Minimum estimated merge probability before a PR is submitted.
+# Set to 0.51 to ensure we only submit PRs we expect to get merged >50% of the time.
+QUALITY_GATE_THRESHOLD = float(os.getenv("QUALITY_GATE_THRESHOLD", "0.25"))
+
+# --- Anthropic API Rate Limiting ---
+# Budget in requests-per-minute across ALL models.
+# The factory auto-regulates concurrency to stay under this limit,
+# leaving headroom for manual Claude Code sessions.
+# Each active agent averages ~10 RPM (30 max_turns over ~3 min).
+ANTHROPIC_RPM_BUDGET = int(os.getenv("ANTHROPIC_RPM_BUDGET", "40"))
+ESTIMATED_RPM_PER_AGENT = 10  # empirical average per agent
 
 # --- Model Tiers (Daniel Tier System) ---
 # Edit tiers.json in the project root to change tiers live — no restart needed.
 # The factory hot-reloads this file on each agent spawn.
 TIERS_FILE = PROJECT_ROOT / "tiers.json"
-_tiers_cache: dict = {"mtime": 0.0, "tiers": []}
+ARCHITECT_PREFS_FILE = Path.home() / "Library/Application Support/BatesAI/shared/architect_preferences.json"
+SELECTED_MODEL_SIGNAL = Path("/tmp/dogood-selected-provider")
+_tiers_cache: dict = {"mtime": 0.0, "architect_mtime": 0.0, "tiers": []}
+
+
+PRIMARY_MODEL = os.getenv("DOGOOD_PRIMARY_MODEL", "claude-fable-5-1")
+
+
+def primary_model() -> str:
+    from src.llm import model_for
+    return model_for("primary")
+
+
+def reviewer_model() -> str:
+    from src.llm import model_for
+    return model_for("reviewer")
+
+
+# A PR is only posted when the independent acceptance review scores at least this.
+AUTO_SUBMIT_MIN_CONFIDENCE = float(os.getenv("AUTO_SUBMIT_MIN_CONFIDENCE", "0.95"))
 
 
 def load_model_tiers() -> list[dict]:
-    """Load model tiers from tiers.json, hot-reloading when file changes."""
-    import json as _json
-    try:
-        mtime = TIERS_FILE.stat().st_mtime
-        if mtime != _tiers_cache["mtime"]:
-            _tiers_cache["tiers"] = _json.loads(TIERS_FILE.read_text())
-            _tiers_cache["mtime"] = mtime
-        return _tiers_cache["tiers"]
-    except Exception:
-        pass
-    # Fallback if file missing/corrupt
+    """One tier: whatever solver model is chosen in the menu bar app (default Fable 5.1)."""
+    model = primary_model()
     return [
-        {"tier": 1, "model": "claude-sonnet-4-6", "effort": "low", "label": "sonnet-low"},
-        {"tier": 2, "model": "claude-sonnet-4-6", "effort": "high", "label": "sonnet-high"},
-        {"tier": 3, "model": "claude-opus-4-6", "effort": "high", "label": "opus-high"},
+        {"tier": 1, "model": model, "effort": "high", "thinking": True, "label": model},
     ]
 
 
@@ -239,3 +273,11 @@ MODEL_TIERS = load_model_tiers()
 
 # --- Log file ---
 LOG_FILE = PROJECT_ROOT / "Claude Agent - dogood.md"
+
+# --- Human Approval Gate ---
+# When true (default), daemons prepare fixes locally and queue the PR in
+# PENDING_PR_QUEUE instead of pushing branches or opening pull requests.
+# To approve later: review data/pending_prs.jsonl and run the recorded
+# push_cmd + pr_create_cmd, or set REQUIRE_HUMAN_APPROVAL=false in .env.
+REQUIRE_HUMAN_APPROVAL = os.getenv("REQUIRE_HUMAN_APPROVAL", "true").strip().lower() not in ("0", "false", "no", "off")
+PENDING_PR_QUEUE = DATA_DIR / "pending_prs.jsonl"
