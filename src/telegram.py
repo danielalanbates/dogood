@@ -161,6 +161,7 @@ class TelegramDaemon:
         print(f"  Inbox:  {TELEGRAM_INBOX}", flush=True)
         print(f"  Outbox: {TELEGRAM_OUTBOX}", flush=True)
         print(flush=True)
+        self._announce_pending()
 
         while True:
             try:
@@ -179,6 +180,33 @@ class TelegramDaemon:
             except Exception as e:
                 print(f"  Telegram poll error: {e}", flush=True)
                 time.sleep(poll_interval)
+
+    ANNOUNCE_FILE = Path("/tmp/dogood-telegram-announced.json")
+
+    def _announce_pending(self):
+        """On (re)start, tell Daniel what is still waiting for his yes, so the queue resumes.
+
+        Throttled: the same set of waiting ids is announced at most once every 6 hours,
+        so a crash-restart loop can't spam him."""
+        try:
+            from src import approvals
+            waiting = approvals.pending()
+            if not waiting:
+                return
+            ids = sorted(e["id"] for e in waiting)
+            try:
+                last = json.loads(self.ANNOUNCE_FILE.read_text())
+            except Exception:
+                last = {}
+            if last.get("ids") == ids and time.time() - last.get("at", 0) < 6 * 3600:
+                return
+            lines = [f"#{e['id']} ({e['kind']}): {e['summary'][:300]}" for e in waiting]
+            text = ("I'm back online. Still waiting for your OK before posting to GitHub:\n\n"
+                    + "\n\n".join(lines) + "\n\nSay yes or no (with the number if more than one).")
+            if send_message(text[:4000]):
+                self.ANNOUNCE_FILE.write_text(json.dumps({"ids": ids, "at": time.time()}))
+        except Exception as e:
+            print(f"  [TELEGRAM] pending announcement failed: {e}", flush=True)
 
     def _build_context(self, text: str, reply_to: dict) -> str:
         """Build context string for Claude from conversation history and notifications."""
@@ -334,8 +362,9 @@ class TelegramDaemon:
         from src import approvals
         from src.config import primary_model, reviewer_model
         lines = []
-        for label in self.FACTORY_LABELS + ["com.batesai.dogood.telegramd"]:
+        for label in self.FACTORY_LABELS:
             lines.append(f"{label.split('.')[-1]}: {'on' if self._is_loaded(label) else 'off'}")
+        lines.append("chat bot: on (DaemonManager DoGood Factory chain)")
         try:
             log = Path("/tmp/dogood-factory.log").read_text().strip().splitlines()
             recent = [l.strip() for l in log[-40:] if l.strip() and not l.startswith("  File")]
