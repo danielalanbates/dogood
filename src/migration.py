@@ -241,6 +241,14 @@ MIGRATIONS = [
             ALTER TABLE contributions ADD COLUMN mandatory_model TEXT;
         """,
     },
+    # Migration 17: upsert_repository writes pushed_at but the column never existed
+    {
+        "id": 17,
+        "description": "Add pushed_at to repositories (repo freshness check)",
+        "sql": """
+            ALTER TABLE repositories ADD COLUMN pushed_at TIMESTAMP;
+        """,
+    },
 ]
 
 
