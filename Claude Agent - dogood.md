@@ -1,5 +1,23 @@
 ## 2026-02-19 08:45 PM — PR SUBMITTED
 
+## 2026-09-17 22:43 — PR SUBMITTED
+**Repo:** airbnb/javascript
+**Issue/PR:** #3069 — [eslint-config-airbnb] `jsx-a11y/control-has-associated-label` config does not ignore `td` and `th` HTML elements
+**Model:** claude-fable-5-1
+**PR:** https://github.com/airbnb/javascript/pull/3320
+**Agent:** 7e0e181e01a0
+**Action needed:** No
+---
+
+## 2026-09-17 20:34 — PR SUBMITTED
+**Repo:** google-gemini/gemini-cli
+**Issue/PR:** #29315 — bug(a2a-server): express.json registered after A2A routes, req.body undefined
+**Model:** claude-fable-5-1
+**PR:** https://github.com/google-gemini/gemini-cli/pull/29386
+**Agent:** 0f9eef0beae0
+**Action needed:** No
+---
+
 ## 2026-09-17 20:24 — FACTORY PAUSED
 **Reason:** billing_error (streak=1)
 **Error counts:** {"billing_error": 1}
