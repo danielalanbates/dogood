@@ -19,6 +19,7 @@ class DaemonManager {
 
     func load(_ config: DaemonConfig) {
         guard config.plistExists else { return }
+        shell("launchctl enable gui/\(uid)/\(config.label) 2>&1")
         if isLoaded(config.label) { return }
         shell("launchctl bootstrap gui/\(uid) \"\(config.plistPath)\" 2>&1")
     }
@@ -64,13 +65,13 @@ class DaemonManager {
         if currentlyRunning {
             // Running → stop it
             unload(config)
-        } else if currentlyLoaded {
-            // Loaded but not running (scheduled daemon) → kickstart it now
-            kickstart(config)
         } else {
-            // Not loaded → load and kickstart
-            load(config)
-            usleep(500_000)
+            // Ensure enabled and loaded, then kickstart
+            shell("launchctl enable gui/\(uid)/\(config.label) 2>&1")
+            if !isLoaded(config.label) {
+                shell("launchctl bootstrap gui/\(uid) \"\(config.plistPath)\" 2>&1")
+                usleep(500_000)
+            }
             kickstart(config)
         }
     }

@@ -140,95 +140,6 @@ class HelperToggleView: NSView {
     }
 }
 
-// MARK: - Launch helper button (prevents menu from closing on click)
-
-class LaunchHelperView: NSView {
-    private weak var delegate: AppDelegate?
-    private let button = NSButton()
-    private let spinner = NSProgressIndicator()
-    private let statusLabel = NSTextField(labelWithString: "")
-    private let isProcessing: Bool
-    private let helperType: HelperType
-    private var isHovering = false
-
-    init(delegate: AppDelegate?, isProcessing: Bool = false, helperType: HelperType = .general) {
-        self.delegate = delegate
-        self.isProcessing = isProcessing
-        self.helperType = helperType
-        super.init(frame: NSRect(x: 0, y: 0, width: 260, height: 28))
-
-        if isProcessing {
-            // Show spinner + "Launching..." text
-            spinner.style = .spinning
-            spinner.controlSize = .small
-            spinner.frame = NSRect(x: 20, y: 5, width: 16, height: 16)
-            spinner.startAnimation(nil)
-            addSubview(spinner)
-
-            statusLabel.stringValue = "Scanning issues & launching..."
-            statusLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
-            statusLabel.textColor = NSColor.secondaryLabelColor
-            statusLabel.frame = NSRect(x: 42, y: 4, width: 180, height: 22)
-            addSubview(statusLabel)
-        } else {
-            button.title = "＋ Launch \(helperType.emoji) \(helperType.displayName)"
-            button.bezelStyle = .inline
-            button.isBordered = false
-            button.font = NSFont.systemFont(ofSize: 12, weight: .medium)
-            button.contentTintColor = NSColor.systemGreen
-            button.target = self
-            button.action = #selector(didClick)
-            button.frame = NSRect(x: 20, y: 4, width: 220, height: 22)
-            addSubview(button)
-
-            // Enable hover tracking
-            wantsLayer = true
-            layer?.cornerRadius = 4
-            trackHover()
-        }
-    }
-
-    required init?(coder: NSCoder) { fatalError() }
-
-    private func trackHover() {
-        let trackingArea = NSTrackingArea(
-            rect: bounds,
-            options: [.mouseEnteredAndExited, .activeAlways],
-            owner: self,
-            userInfo: nil)
-        addTrackingArea(trackingArea)
-    }
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-    }
-
-    override func mouseEntered(with event: NSEvent) {
-        isHovering = true
-        needsDisplay = true
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        isHovering = false
-        needsDisplay = true
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        if isHovering {
-            NSColor.selectedControlColor.withAlphaComponent(0.15).setFill()
-            bounds.fill()
-        }
-        super.draw(dirtyRect)
-    }
-
-    @objc private func didClick() {
-        // Set the helper type in UserDefaults before launching
-        UserDefaults.standard.selectedHelperType = helperType
-        delegate?.launchHelper()
-    }
-}
-
-
 class MenuBuilder {
 
     /// Update an existing menu in-place so it refreshes live while open
@@ -377,44 +288,6 @@ class MenuBuilder {
             }
         }
 
-        // Launch helper buttons directly in Active Helpers section
-        if let delegate = delegate {
-            menu.addItem(NSMenuItem.separator())
-
-            let launchHeader = NSMenuItem(
-                title: "Launch Helpers",
-                action: nil, keyEquivalent: "")
-            launchHeader.isEnabled = false
-            launchHeader.attributedTitle = NSAttributedString(
-                string: "Launch Helpers",
-                attributes: [
-                    .font: NSFont.boldSystemFont(ofSize: 11),
-                    .foregroundColor: NSColor.secondaryLabelColor
-                ])
-            menu.addItem(launchHeader)
-
-            let generalLaunchView = LaunchHelperView(delegate: delegate, isProcessing: delegate.isLaunchingHelper, helperType: .general)
-            let generalLaunchItem = NSMenuItem()
-            generalLaunchItem.view = generalLaunchView
-            menu.addItem(generalLaunchItem)
-
-            let bountyLaunchView = LaunchHelperView(delegate: delegate, isProcessing: delegate.isLaunchingHelper, helperType: .bounty)
-            let bountyLaunchItem = NSMenuItem()
-            bountyLaunchItem.view = bountyLaunchView
-            menu.addItem(bountyLaunchItem)
-        }
-
-        // Launch result message (shown after factory completes)
-        if let delegate = delegate, let resultMsg = delegate.launchResultMessage {
-            let resultItem = NSMenuItem(title: "    \(resultMsg)", action: nil, keyEquivalent: "")
-            resultItem.isEnabled = false
-            let color: NSColor = resultMsg.contains("launched") ? .systemGreen : .systemOrange
-            resultItem.attributedTitle = NSAttributedString(
-                string: "    \(resultMsg)",
-                attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: color])
-            menu.addItem(resultItem)
-        }
-
         // ── AI Models ──
         menu.addItem(NSMenuItem.separator())
         let modelsHeader = NSMenuItem(title: "AI Models", action: nil, keyEquivalent: "")
@@ -422,28 +295,6 @@ class MenuBuilder {
         menu.addItem(modelsHeader)
         for role in FactoryModelChoice.roles {
             menu.addItem(FactoryModelMenuTarget.shared.menuItem(title: role.title, role: role.key))
-        }
-
-        // ── Options ──
-        menu.addItem(NSMenuItem.separator())
-
-        let optionsHeader = NSMenuItem(
-            title: "Options",
-            action: nil, keyEquivalent: "")
-        optionsHeader.isEnabled = false
-        optionsHeader.attributedTitle = NSAttributedString(
-            string: "Options",
-            attributes: [
-                .font: NSFont.boldSystemFont(ofSize: 11),
-                .foregroundColor: NSColor.secondaryLabelColor
-            ])
-        menu.addItem(optionsHeader)
-
-        if let delegate = delegate {
-            let helperTypeView = HelperTypeSelectorView(delegate: delegate)
-            let helperTypeItem = NSMenuItem()
-            helperTypeItem.view = helperTypeView
-            menu.addItem(helperTypeItem)
         }
 
         // Timestamp
