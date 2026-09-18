@@ -59,13 +59,15 @@ class _SkipClaudeSDK(Exception):
 class Solver:
     def __init__(self, token: str = GITHUB_TOKEN, username: str = GITHUB_USERNAME,
                  agent_id: str = "main", work_dir: Path = WORK_DIR,
-                 model_tier: dict = None, is_bounty: bool = False):
+                 model_tier: dict = None, is_bounty: bool = False,
+                 is_spreadsheet: bool = False):
         self.token = token
         self.username = username
         self.agent_id = agent_id
         self.work_dir = work_dir
         self.model_tier = model_tier  # None = use defaults (backward compatible)
         self.is_bounty = is_bounty
+        self.is_spreadsheet = is_spreadsheet
 
     def score_issue_quality(self, issue: dict) -> tuple[float, list[str]]:
         """Score issue quality/actionability from 0.0 (skip) to 1.0 (ideal).
@@ -372,9 +374,10 @@ class Solver:
 
             if result["success"]:
                 # --- Quality Gate: estimate merge probability before submitting ---
-                # Bounties skip the quality gate — always attempt with Opus 4.6
-                if self.is_bounty:
-                    print("  Quality gate: SKIPPED (bounty — always attempt)")
+                # Bounties and spreadsheet issues skip the heuristic gate — evaluated by LLM 95% acceptance review
+                if self.is_bounty or self.is_spreadsheet or issue.get("_source_spreadsheet"):
+                    source_label = issue.get("_source_spreadsheet") or ("spreadsheet" if self.is_spreadsheet else "bounty")
+                    print(f"  Quality gate: SKIPPED ({source_label} issue — LLM 95% acceptance review evaluates)", flush=True)
                 else:
                     from src.model_selector import estimate_merge_probability
                     from src.config import QUALITY_GATE_THRESHOLD
@@ -411,17 +414,27 @@ class Solver:
                 finally:
                     reviewing_flag.unlink(missing_ok=True)
                 submit = confidence >= AUTO_SUBMIT_MIN_CONFIDENCE
+                print(f"  Acceptance review: {confidence:.0%} "
+                      f"(threshold {AUTO_SUBMIT_MIN_CONFIDENCE:.0%}) — "
+                      f"{'meets 95% assurance threshold' if submit else 'below 95% threshold, rejecting'}")
+                if review_notes:
+                    print(f"    {review_notes[:400]}")
+
+                if not submit:
+                    print(f"  [QUALITY GATE] Rejected: {owner}/{repo_name}#{issue_number} assurance ({confidence:.0%}) < {AUTO_SUBMIT_MIN_CONFIDENCE:.0%}", flush=True)
+                    update_contribution_status(conn, contrib_id, "rejected_quality", f"Assurance {confidence:.0%} < {AUTO_SUBMIT_MIN_CONFIDENCE:.0%}: {review_notes}")
+                    return {
+                        "success": False,
+                        "error": f"Acceptance review {confidence:.0%} is below {AUTO_SUBMIT_MIN_CONFIDENCE:.0%} threshold",
+                        "notes": review_notes,
+                    }
+
                 self._approval_context = {
                     "contribution_id": contrib_id,
                     "confidence": confidence,
                     "review": review_notes,
                     "propose": submit,
                 }
-                print(f"  Acceptance review: {confidence:.0%} "
-                      f"(threshold {AUTO_SUBMIT_MIN_CONFIDENCE:.0%}) — "
-                      f"{'asking Daniel via Telegram' if submit else 'below threshold, not proposed'}")
-                if review_notes:
-                    print(f"    {review_notes[:400]}")
 
                 print("  Creating pull request...")
                 pr_url = self._push_and_pr(
@@ -1108,15 +1121,15 @@ CRITICAL guidelines:
                                             "authentication_error",
                                             "api key is invalid"]
 
-                    if any(p in result_lower for p in billing_patterns):
-                        raise Exception(
-                            f"billing_error: {result_text.strip()[:300]}"
-                        ) from e
-
-                    if any(p in result_lower for p in auth_patterns_result):
-                        raise Exception(
-                            f"auth_error: {result_text.strip()[:300]}"
-                        ) from e
+                    if any(p in result_lower for p in billing_patterns) or any(p in result_lower for p in auth_patterns_result) or "error result: success" in err_str or "disabled claude subscription access" in err_str:
+                        print("  [DELEGATION] Primary driver (Fable 5.1) delegating fix execution to Gemini 3.8 Flash...", flush=True)
+                        from src.llm import run_agent_in
+                        try:
+                            result_text = run_agent_in(clone_path, prompt, system_prompt, model="gemini-3.8-flash-high")
+                            break
+                        except Exception as de:
+                            print(f"  [DELEGATION] Delegated agent failed: {de}", flush=True)
+                            raise de from e
 
                     if ("rate_limit" in err_str or "hit your limit" in err_str
                             or any(p in result_lower for p in ["rate_limit", "rate limit", "hit your limit"])
@@ -1321,9 +1334,7 @@ CRITICAL guidelines:
         guidelines: dict | None = None,
     ) -> str:
         """Prepare the PR; it is queued for Daniel's Telegram approval, never posted directly."""
-        guidelines = guidelines or {}
-
-        REQUIRE_HUMAN_APPROVAL = True
+        from src.config import REQUIRE_HUMAN_APPROVAL
 
         if not REQUIRE_HUMAN_APPROVAL:
             subprocess.run(

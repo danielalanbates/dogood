@@ -120,10 +120,17 @@ def complete(role: str, prompt: str, system: str = "", timeout: int = 300, cwd: 
     return out
 
 
-def run_agent_in(clone_path: Path, prompt: str, system: str, timeout: int = 1800) -> str:
+def run_agent_in(clone_path: Path, prompt: str, system: str, timeout: int = 1800, model: str | None = None) -> str:
     """Let an Antigravity model work on the clone with file-edit tools. Returns its final text."""
-    model = model_for("primary")
-    cmd = [AGY, "-p", f"{system}\n\n{prompt}", "--model", model[4:],
+    if not model:
+        chosen = model_for("primary")
+        if chosen.startswith("agy:"):
+            model = chosen[4:]
+        else:
+            model = "gemini-3.8-flash-high"
+    elif model.startswith("agy:"):
+        model = model[4:]
+    cmd = [AGY, "-p", f"{system}\n\n{prompt}", "--model", model,
            "--dangerously-skip-permissions", "--add-dir", str(clone_path),
            "--output-format", "text", "--print-timeout", f"{timeout}s"]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 60,

@@ -660,6 +660,80 @@ def get_next_tagged_issue(conn: sqlite3.Connection, tag: str,
     return dict(row) if row else None
 
 
+def get_next_spreadsheet_issue(conn: sqlite3.Connection, spreadsheet_dir: str = None) -> dict | None:
+    """Get the next eligible issue specified in spreadsheets in the Google Drive or project spreadsheets directory."""
+    import csv
+    from pathlib import Path
+
+    search_dirs = []
+    if spreadsheet_dir:
+        search_dirs.append(Path(spreadsheet_dir))
+    gdrive_dir = Path("/Users/daniel/Library/CloudStorage/GoogleDrive-danielalanbates@gmail.com/My Drive/Code/dogood/spreadsheets")
+    if gdrive_dir.exists():
+        search_dirs.append(gdrive_dir)
+    local_dir = Path(__file__).resolve().parent.parent / "spreadsheets"
+    if local_dir.exists():
+        search_dirs.append(local_dir)
+
+    for sdir in search_dirs:
+        for csv_path in sorted(sdir.glob("*.csv")):
+            if not csv_path.is_file():
+                continue
+            try:
+                with open(csv_path, "r", encoding="utf-8", errors="ignore") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        issue_id = row.get("issue_id") or row.get("id")
+                        repo = row.get("repository") or row.get("repo") or row.get("full_name")
+                        number = row.get("issue_number") or row.get("number")
+                        if issue_id:
+                            try:
+                                iid = int(issue_id)
+                                query = """
+                                    SELECT i.*, r.full_name, r.language, r.stars, r.owner, r.name as repo_name,
+                                           r.url as repo_url, r.id as rid, r.combined_score,
+                                           0 as is_bounty, 0 as is_help_wanted, 0 as is_focus_repo, 0 as is_sponsor
+                                    FROM issues i
+                                    JOIN repositories r ON i.repo_id = r.id
+                                    WHERE i.id = ? AND i.state = 'open'
+                                      AND i.id NOT IN (SELECT issue_id FROM issue_claims WHERE status = 'active')
+                                      AND i.id NOT IN (SELECT issue_id FROM contributions WHERE issue_id IS NOT NULL AND status IN ('pr_created', 'merged', 'pending_approval'))
+                                      AND r.full_name NOT IN (SELECT full_name FROM repo_blacklist WHERE forgiven_at IS NULL)
+                                """
+                                res = conn.execute(query, (iid,)).fetchone()
+                                if res:
+                                    d = dict(res)
+                                    d["_source_spreadsheet"] = csv_path.name
+                                    return d
+                            except ValueError:
+                                pass
+                        elif repo and number:
+                            try:
+                                num = int(number)
+                                query = """
+                                    SELECT i.*, r.full_name, r.language, r.stars, r.owner, r.name as repo_name,
+                                           r.url as repo_url, r.id as rid, r.combined_score,
+                                           0 as is_bounty, 0 as is_help_wanted, 0 as is_focus_repo, 0 as is_sponsor
+                                    FROM issues i
+                                    JOIN repositories r ON i.repo_id = r.id
+                                    WHERE r.full_name = ? AND i.number = ? AND i.state = 'open'
+                                      AND i.id NOT IN (SELECT issue_id FROM issue_claims WHERE status = 'active')
+                                      AND i.id NOT IN (SELECT issue_id FROM contributions WHERE issue_id IS NOT NULL AND status IN ('pr_created', 'merged', 'pending_approval'))
+                                      AND r.full_name NOT IN (SELECT full_name FROM repo_blacklist WHERE forgiven_at IS NULL)
+                                """
+                                res = conn.execute(query, (repo.strip(), num)).fetchone()
+                                if res:
+                                    d = dict(res)
+                                    d["_source_spreadsheet"] = csv_path.name
+                                    return d
+                            except ValueError:
+                                pass
+            except Exception as e:
+                print(f"  [SPREADSHEET] Error reading {csv_path}: {e}", flush=True)
+
+    return None
+
+
 # --- Learned patterns ---
 
 def add_learned_pattern(conn: sqlite3.Connection, pattern_type: str,

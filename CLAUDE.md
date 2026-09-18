@@ -187,7 +187,9 @@ We only contribute to wholesome projects aligned with Christian values. Do NOT c
 The `BLOCKED_TOPICS` and `BLOCKED_DESCRIPTION_KEYWORDS` in `src/config.py` enforce this automatically. Repos matching these get a combined_score of -1.
 
 ## Apple Notes Integration
-Update the Apple Note at Work > AI > "Claude Agent" with a reverse-chronological log using 12-hour timestamps. Format: `[2:15 PM] PR #12 submitted: owner/repo #number - description`
+> **⚠️ RESTRICTION:** Do NOT use Apple Notes unless the CEO explicitly instructs you to. All agents must avoid writing to Apple Notes autonomously. This is a CEO directive effective 2026-03-06.
+
+~~Update the Apple Note at Work > AI > "Claude Agent" with a reverse-chronological log using 12-hour timestamps. Format: `[2:15 PM] PR #12 submitted: owner/repo #number - description`~~ **(DISABLED — see restriction above)**
 
 ## GitHub Notifications & Feedback Loop
 The feedback loop (`src/feedback.py`) automatically polls GitHub notifications every 5 minutes and:
@@ -320,3 +322,8 @@ This prevents two agents from duplicating effort on the same issue.
 - Eugeny/tabby: CLA required — skip
 - oppia/oppia: requires issue assignment before PR
 - scrapy/scrapy: reviewer wRAR expects thorough PRs — don't submit partial fixes
+- mrdoob/three.js: BLOCKED — maintainer blocked us, hostile to AI PRs, permanently blacklisted
+- louislam/uptime-kuma: labels AI PRs as "ai-slop", auto-closes — permanently blacklisted
+- expressjs/express: maintainer complained about AI PR spam — permanently blacklisted
+- ChatGPTNextWeb/NextChat: bulk-closes all external PRs without comment — permanently blacklisted
+- open-webui/open-webui: requires CLA, dev branch target, strict PR template — skip

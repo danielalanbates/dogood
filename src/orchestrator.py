@@ -27,6 +27,7 @@ from src.rate_coordinator import is_in_cooldown, seconds_until_clear
 from src.pr_safety import can_create_pr, record_pr_created, check_close_ratio, can_pr_repo, record_repo_pr
 from src.db import (
     get_next_unclaimed_issue, get_next_tagged_issue,
+    get_next_spreadsheet_issue,
     record_agent_run, update_agent_run,
     get_next_feedback_revision, update_feedback_status,
 )
@@ -604,12 +605,20 @@ class AgentFactory:
                 await self._run_feedback_inline(agent_id, feedback_item, model_tier)
                 continue
 
-            # PRIORITY #2: Christian repos
-            issue = get_next_tagged_issue(conn, "christian", min_stars=0)
+            # PRIORITY: Spreadsheet issues (from code folder dogood/spreadsheets)
+            issue = get_next_spreadsheet_issue(conn)
             if issue:
-                issue["_tagged"] = "christian"
-                print(f"  [CHRISTIAN] Prioritizing Christian repo: "
-                      f"{issue['full_name']}#{issue['number']}", flush=True)
+                src_sheet = issue.get("_source_spreadsheet", "spreadsheet")
+                print(f"  [SPREADSHEET] Prioritizing issue from {src_sheet}: "
+                      f"{issue['full_name']}#{issue['number']} - {issue.get('title', '')[:50]}", flush=True)
+
+            # PRIORITY #2: Christian repos
+            if not issue:
+                issue = get_next_tagged_issue(conn, "christian", min_stars=0)
+                if issue:
+                    issue["_tagged"] = "christian"
+                    print(f"  [CHRISTIAN] Prioritizing Christian repo: "
+                          f"{issue['full_name']}#{issue['number']}", flush=True)
 
             # PRIORITY #3: Regular issues
             if not issue:
@@ -718,6 +727,7 @@ class AgentFactory:
                 agent_id=agent_id,
                 model_tier=model_tier,
                 is_bounty=bool(issue.get("is_bounty")),
+                is_spreadsheet=bool(issue.get("_source_spreadsheet")),
             )
             result = await solver.solve_issue(issue["id"])
 
