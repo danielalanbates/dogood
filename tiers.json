@@ -1,16 +1,10 @@
 [
     {
         "tier": 1,
-        "model": "claude-sonnet-4-6",
-        "effort": "low",
-        "label": "sonnet-low",
-        "description": "Default worker tier — all 4 agents run here"
-    },
-    {
-        "tier": 2,
         "model": "claude-opus-4-6",
         "effort": "high",
+        "thinking": true,
         "label": "opus-high",
-        "description": "Comment responses and feedback revisions only"
+        "description": "Opus with extended thinking — primary solver for all issues and feedback"
     }
 ]

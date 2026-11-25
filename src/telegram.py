@@ -4,7 +4,9 @@ Outbound: notify Daniel about GitHub events.
 Inbound:  pipe Daniel's messages to Claude Code for intelligent processing.
 """
 
+import urllib.request
 import subprocess
+import urllib.parse
 import json
 import time
 import re
@@ -12,16 +14,66 @@ import os
 from datetime import datetime
 from collections import deque
 from pathlib import Path
+from dotenv import load_dotenv
 
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
-API_URL = f"{BASE_URL}/sendMessage"
+# Load .env file if it exists
+load_dotenv(override=True)
 
-PROJECT_DIR = "/Volumes/X10 Pro danielalanbatesatgmail.com /AIcode/dogood"
+DAEMON_MANAGER_DIR = Path.home() / "Library/Application Support/DaemonManager"
+# Do Good talks to Daniel through this DaemonManager department bot.
+NOTIFY_ROLE = os.environ.get("DOGOOD_TELEGRAM_ROLE", "philanthropy")
+
+
+def _daemon_manager_credentials(role: str) -> tuple[str | None, str | None]:
+    """Token from DaemonManager bots.json; chat id from that bot's launchd plist."""
+    token = chat_id = None
+    try:
+        bots = json.loads((DAEMON_MANAGER_DIR / "bots.json").read_text())
+        bot = next(b for b in bots if b.get("role") == role)
+        token = bot.get("token")
+        label = bot.get("launchdLabel")
+        if label:
+            import plistlib
+            plist = Path.home() / "Library/LaunchAgents" / f"{label}.plist"
+            with open(plist, "rb") as f:
+                chat_id = plistlib.load(f).get("EnvironmentVariables", {}).get("TELEGRAM_CHAT_ID")
+    except Exception as e:
+        print(f"  [TELEGRAM] DaemonManager '{role}' bot lookup failed: {e}", flush=True)
+    return token, chat_id
+
+
+_dm_token, _dm_chat = _daemon_manager_credentials(NOTIFY_ROLE)
+BOT_TOKEN = _dm_token or os.environ.get("TELEGRAM_BOT_TOKEN")
+CHAT_ID = _dm_chat or os.environ.get("TELEGRAM_CHAT_ID")
+
+if not BOT_TOKEN or not CHAT_ID:
+    # If we're in a module that's imported, we might not want to exit immediately,
+    # but for a daemon it's better to fail early with a clear message.
+    print("ERROR: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set in environment", flush=True)
+
+BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
+API_URL = f"{BASE_URL}/sendMessage" if BASE_URL else ""
+
+PROJECT_DIR = "/Users/daniel/Library/Mobile Documents/com~apple~CloudDocs/Code/Tools/github-helper"
 
 TELEGRAM_INBOX = "/tmp/telegram-inbox.jsonl"
 TELEGRAM_OUTBOX = "/tmp/telegram-outbox.jsonl"
+
+
+def _make_request(url: str, data: dict, timeout: int = 15) -> dict:
+    """Helper to make urllib POST requests and return JSON dict."""
+    try:
+        req = urllib.request.Request(url, method="POST")
+        req.add_header('Content-Type', 'application/json')
+        payload = json.dumps(data).encode('utf-8')
+        with urllib.request.urlopen(req, data=payload, timeout=timeout) as response:
+            resp_body = response.read().decode('utf-8')
+            return json.loads(resp_body)
+    except urllib.error.HTTPError as e:
+        print(f"  [TELEGRAM] HTTP Error {e.code}: {e.read().decode('utf-8', errors='ignore')}", flush=True)
+    except Exception as e:
+        print(f"  [TELEGRAM] Request exception: {e}", flush=True)
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -30,37 +82,26 @@ TELEGRAM_OUTBOX = "/tmp/telegram-outbox.jsonl"
 
 def notify(message: str) -> bool:
     """Send a Telegram message to Daniel. Returns True on success."""
-    try:
-        result = subprocess.run(
-            ["curl", "-s", API_URL,
-             "-d", f"chat_id={CHAT_ID}",
-             "-d", f"text={message}",
-             "-d", "parse_mode=Markdown"],
-            capture_output=True, text=True, timeout=15
-        )
-        if result.returncode == 0:
-            resp = json.loads(result.stdout)
-            return resp.get("ok", False)
-    except Exception:
-        pass
-    return False
+    data = {
+        "chat_id": CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown"
+    }
+    resp = _make_request(API_URL, data)
+    return resp.get("ok", False)
 
 
 def notify_plain(message: str) -> bool:
     """Send a plain-text Telegram message (no Markdown parsing issues)."""
-    try:
-        result = subprocess.run(
-            ["curl", "-s", API_URL,
-             "-d", f"chat_id={CHAT_ID}",
-             "-d", f"text={message}"],
-            capture_output=True, text=True, timeout=15
-        )
-        if result.returncode == 0:
-            resp = json.loads(result.stdout)
-            return resp.get("ok", False)
-    except Exception:
-        pass
-    return False
+    return send_message(message) is not None
+
+
+def send_message(message: str) -> int | None:
+    """Send plain text; returns Telegram's message_id so reactions can be matched later."""
+    resp = _make_request(API_URL, {"chat_id": CHAT_ID, "text": message})
+    if resp.get("ok"):
+        return resp.get("result", {}).get("message_id")
+    return None
 
 
 def notify_github_attention(event_type: str, repo: str, url: str, summary: str):
@@ -68,11 +109,9 @@ def notify_github_attention(event_type: str, repo: str, url: str, summary: str):
     emoji = {
         "payment_request": "\U0001f4b0",
         "job_inquiry": "\U0001f4bc",
-        "question": "\u2753",
-        "review_needs_human": "\U0001f440",
         "contact_request": "\U0001f4e7",
-        "bounty_found": "\U0001f3af",
-        "pr_merged": "\u2705",
+        "cla_request": "\U0001f4dd",
+        "sponsor": "\U0001f4b0",
     }.get(event_type, "\U0001f4e2")
 
     msg = f"{emoji} *{event_type.replace('_', ' ').title()}*\n"
@@ -89,21 +128,14 @@ def notify_github_attention(event_type: str, repo: str, url: str, summary: str):
 
 def get_updates(offset: int = 0, timeout: int = 30) -> list:
     """Long-poll Telegram for new messages from Daniel."""
-    try:
-        result = subprocess.run(
-            ["curl", "-s", f"{BASE_URL}/getUpdates",
-             "-d", f"offset={offset}",
-             "-d", f"timeout={timeout}",
-             "-d", "allowed_updates=[\"message\"]"],
-            capture_output=True, text=True, timeout=timeout + 10
-        )
-        if result.returncode == 0:
-            resp = json.loads(result.stdout)
-            if resp.get("ok"):
-                return resp.get("result", [])
-    except Exception:
-        pass
-    return []
+    url = f"{BASE_URL}/getUpdates"
+    data = {
+        "offset": offset,
+        "timeout": timeout,
+        "allowed_updates": ["message", "message_reaction"]
+    }
+    resp = _make_request(url, data, timeout=timeout + 10)
+    return resp.get("result", [])
 
 
 def extract_github_url(text: str) -> str | None:
@@ -113,7 +145,7 @@ def extract_github_url(text: str) -> str | None:
 
 
 class TelegramDaemon:
-    """Polls Telegram for messages and pipes them to Claude Code."""
+    """Polls the Philanthropy bot: commands run directly, chat goes to the chosen AI (Antigravity)."""
 
     def __init__(self):
         self.offset = 0
@@ -121,6 +153,7 @@ class TelegramDaemon:
         self.recent_notifications = deque(maxlen=20)
         # Conversation history — passed to Claude each call so it has memory
         self.conversation = deque(maxlen=20)
+        self.sent_messages: dict[int, str] = {}
 
     def run(self, poll_interval: int = 5):
         """Run the Telegram daemon — long-polls for messages."""
@@ -128,6 +161,7 @@ class TelegramDaemon:
         print(f"  Inbox:  {TELEGRAM_INBOX}", flush=True)
         print(f"  Outbox: {TELEGRAM_OUTBOX}", flush=True)
         print(flush=True)
+        self._announce_pending()
 
         while True:
             try:
@@ -135,19 +169,7 @@ class TelegramDaemon:
                 updates = get_updates(offset=self.offset, timeout=5)
                 for update in updates:
                     self.offset = update["update_id"] + 1
-                    msg = update.get("message", {})
-                    chat_id = str(msg.get("chat", {}).get("id", ""))
-
-                    # Only process messages from Daniel
-                    if chat_id != CHAT_ID:
-                        continue
-
-                    text = msg.get("text", "").strip()
-                    if not text:
-                        continue
-
-                    reply_to = msg.get("reply_to_message", {})
-                    self._handle_message(text, reply_to)
+                    self._handle_update(update)
 
                 # Poll outbox for responses from Claude Code session
                 self._poll_outbox()
@@ -158,6 +180,33 @@ class TelegramDaemon:
             except Exception as e:
                 print(f"  Telegram poll error: {e}", flush=True)
                 time.sleep(poll_interval)
+
+    ANNOUNCE_FILE = Path("/tmp/dogood-telegram-announced.json")
+
+    def _announce_pending(self):
+        """On (re)start, tell Daniel what is still waiting for his yes, so the queue resumes.
+
+        Throttled: the same set of waiting ids is announced at most once every 6 hours,
+        so a crash-restart loop can't spam him."""
+        try:
+            from src import approvals
+            waiting = approvals.pending()
+            if not waiting:
+                return
+            ids = sorted(e["id"] for e in waiting)
+            try:
+                last = json.loads(self.ANNOUNCE_FILE.read_text())
+            except Exception:
+                last = {}
+            if last.get("ids") == ids and time.time() - last.get("at", 0) < 6 * 3600:
+                return
+            lines = [f"#{e['id']} ({e['kind']}): {e['summary'][:300]}" for e in waiting]
+            text = ("I'm back online. Still waiting for your OK before posting to GitHub:\n\n"
+                    + "\n\n".join(lines) + "\n\nSay yes or no (with the number if more than one).")
+            if send_message(text[:4000]):
+                self.ANNOUNCE_FILE.write_text(json.dumps({"ids": ids, "at": time.time()}))
+        except Exception as e:
+            print(f"  [TELEGRAM] pending announcement failed: {e}", flush=True)
 
     def _build_context(self, text: str, reply_to: dict) -> str:
         """Build context string for Claude from conversation history and notifications."""
@@ -189,89 +238,221 @@ class TelegramDaemon:
 
         return "\n\n".join(parts)
 
+    FACTORY_LABELS = ["com.batesai.dogood.scout", "com.batesai.dogood.factory", "com.batesai.dogood.feedback",
+                      "com.batesai.dogood.bountywatch"]
+    HELP = ("Commands:\n"
+            "status — what the factory is doing\n"
+            "start / stop — run or halt the factory\n"
+            "pending — posts waiting for your OK\n"
+            "yes <n> / no <n> — post or discard request n\n"
+            "Anything else, just ask.")
+
+    def _handle_update(self, update: dict):
+        """Turn any message, sticker, photo caption, or reaction into text for the AI."""
+        reaction = update.get("message_reaction")
+        if reaction:
+            if str(reaction.get("chat", {}).get("id", "")) != CHAT_ID:
+                return
+            emojis = [r.get("emoji", "") for r in reaction.get("new_reaction", []) if r.get("type") == "emoji"]
+            if not emojis:
+                return
+            reacted = self._find_message(reaction.get("message_id"))
+            self._handle_message(f"(Daniel reacted {''.join(emojis)} to your message)",
+                                 {"text": reacted} if reacted else {})
+            return
+
+        msg = update.get("message", {})
+        if str(msg.get("chat", {}).get("id", "")) != CHAT_ID:
+            return
+        text = (msg.get("text") or msg.get("caption") or "").strip()
+        if not text and msg.get("sticker"):
+            text = f"(sticker {msg['sticker'].get('emoji', '')})"
+        if not text:
+            kinds = [k for k in ("photo", "voice", "video", "document", "audio") if k in msg]
+            if not kinds:
+                return
+            text = f"(Daniel sent a {kinds[0]} with no text)"
+        self._handle_message(text, msg.get("reply_to_message", {}))
+
+    def _find_message(self, message_id: int | None) -> str:
+        """Text of a message we sent, so a reaction can be understood in context."""
+        if message_id is None:
+            return ""
+        if message_id in self.sent_messages:
+            return self.sent_messages[message_id]
+        from src import approvals
+        for e in approvals._read():
+            if e.get("meta", {}).get("telegram_message_id") == message_id:
+                return f"Do Good wants to post (#{e['id']}, {e['kind']}): {e['summary']}"
+        return ""
+
     def _handle_message(self, text: str, reply_to: dict):
-        """Respond to Daniel via claude -p, with inbox fallback for active CLI sessions."""
         ts = datetime.now().strftime("%H:%M:%S")
         print(f"[{ts}] Daniel: {text[:200]}", flush=True)
+        reply = self._ask_ai(text, reply_to or {})
+        if reply is None:
+            reply = self._run_command(text, (reply_to or {}).get("text", "")) or "Sorry, my AI brain is offline for a moment. Simple things like \"status\", \"start\", \"stop\" or \"yes 3\" still work."
+        self.conversation.append({"role": "user", "text": text[:1000]})
+        if not reply:
+            return
+        print(f"[{ts}] <- {reply[:120]}", flush=True)
+        self.conversation.append({"role": "assistant", "text": reply[:1000]})
+        for i in range(0, len(reply), 4000):
+            message_id = send_message(reply[i:i + 4000])
+            if message_id:
+                self.sent_messages[message_id] = reply[i:i + 4000][:1000]
 
-        reply_context = ""
-        if reply_to:
-            reply_context = reply_to.get("text", "")[:500]
-            print(f"[{ts}]   (replying to: {reply_context[:100]})", flush=True)
+    def _run_command(self, text: str, reply_text: str = "") -> str | None:
+        """Deterministic commands — no AI tokens. Returns None if text isn't a command."""
+        from src import approvals
+        words = text.strip().lower().rstrip(".!").split()
+        if not words:
+            return None
+        verb, arg = words[0], (words[1] if len(words) > 1 else "")
+        entry_id = int(arg.lstrip("#")) if arg.lstrip("#").isdigit() else None
+        if entry_id is None and reply_text:
+            m = re.search(r"#(\d+)", reply_text)
+            entry_id = int(m.group(1)) if m else None
+        if len(words) > 2:
+            return None
+        if verb in ("yes", "y", "approve", "ok", "post"):
+            return approvals.resolve(entry_id, approve=True)
+        if verb in ("no", "n", "reject", "discard", "skip"):
+            return approvals.resolve(entry_id, approve=False)
+        if verb in ("pending", "queue") and not arg:
+            items = approvals.pending()
+            if not items:
+                return "Nothing is waiting for approval."
+            return "\n\n".join(f"#{e['id']} ({e['kind']}): {e['summary'][:300]}" for e in items)
+        if verb in ("start", "resume", "go") and arg in ("", "factory", "it"):
+            return self._start_factory()
+        if verb in ("stop", "halt", "pause") and arg in ("", "factory", "it"):
+            return self._stop_factory()
+        if verb == "status" and not arg:
+            return self._status_text()
+        if verb in ("help", "/help", "/start", "commands") and not arg:
+            return self.HELP
+        return None
 
-        # Always write to inbox so CLI session can see it too
-        msg = {
-            "timestamp": datetime.now().isoformat(),
-            "text": text,
-            "reply_to": reply_context,
-        }
+    def _launchctl(self, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["launchctl", *args], capture_output=True, text=True, timeout=30)
+
+    def _is_loaded(self, label: str) -> bool:
+        return self._launchctl("list", label).returncode == 0
+
+    def _start_factory(self) -> str:
+        uid = os.getuid()
+        started = []
+        for label in self.FACTORY_LABELS:
+            plist = Path.home() / "Library/LaunchAgents" / f"{label}.plist"
+            if not plist.exists():
+                continue
+            if not self._is_loaded(label):
+                self._launchctl("bootstrap", f"gui/{uid}", str(plist))
+            started.append(label.split(".")[-1])
+        return f"Started: {', '.join(started)}. Nothing gets posted without your yes."
+
+    def _stop_factory(self) -> str:
+        uid = os.getuid()
+        self._launchctl("bootout", f"gui/{uid}/com.batesai.dogood.factory")
+        Path("/tmp/dogood-factory.pid").unlink(missing_ok=True)
+        return "Factory stopped. Feedback checks and this chat stay on. Say \"start\" to resume."
+
+    def _status_text(self) -> str:
+        from src import approvals
+        from src.config import primary_model, reviewer_model
+        lines = []
+        for label in self.FACTORY_LABELS:
+            lines.append(f"{label.split('.')[-1]}: {'on' if self._is_loaded(label) else 'off'}")
+        lines.append("chat bot: on (DaemonManager DoGood Factory chain)")
         try:
-            inbox = Path(TELEGRAM_INBOX)
-            with inbox.open("a") as f:
-                f.write(json.dumps(msg) + "\n")
-        except Exception:
-            pass
+            log = Path("/tmp/dogood-factory.log").read_text().strip().splitlines()
+            recent = [l.strip() for l in log[-40:] if l.strip() and not l.startswith("  File")]
+            pause = next((l for l in reversed(recent) if "PAUSED" in l or "Sleeping" in l), None)
+            lines.append(f"Last factory activity: {recent[-1][:200]}" if recent else "No factory log yet")
+            if pause and recent and ("Sleeping" in recent[-1]):
+                lines.append(f"Paused: {pause[:200]}")
+        except OSError:
+            lines.append("No factory log yet")
+        lines.append(f"Waiting for your OK: {len(approvals.pending())}")
+        from src.llm import model_for
+        lines.append(f"Models: scout {model_for('scout')}, fixer {primary_model()}, reviewer {reviewer_model()}")
+        lines.append("(factory = the Fixer; scout finds and rates issues; the Fixer takes the best-rated first)")
+        return "\n".join(lines)
 
-        # Record in conversation history
-        self.conversation.append({"role": "user", "text": text[:500]})
-
-        # Build context
-        context = self._build_context(text, reply_to)
-
-        system_prompt = (
-            "You are Claude, Daniel Bates' AI assistant. Daniel is messaging you via Telegram.\n"
-            "You manage dogood — an autonomous agent factory that finds and fixes "
-            "bugs on open-source projects.\n\n"
-            "RULES:\n"
-            "- Keep responses concise and Telegram-friendly (under 2000 chars)\n"
-            "- If Daniel asks about status, query the SQLite DB at data/github_helper.db\n"
-            "- If Daniel asks to reply to a GitHub PR/issue, use `gh pr comment` or `gh issue comment`\n"
-            "- You have full access to the project at: " + PROJECT_DIR + "\n"
-            "- Be direct. No fluff.\n"
+    def _ask_ai(self, text: str, reply_to: dict) -> str | None:
+        """Chat through the chosen Antigravity model, with Do Good controls. None means the AI is unavailable."""
+        from src import approvals
+        waiting = approvals.pending()
+        waiting_text = "\n".join(f"#{e['id']} ({e['kind']}): {e['summary'][:400]}" for e in waiting) or "none"
+        reply_text = (reply_to or {}).get("text", "")
+        system = (
+            "You are Daniel's assistant, chatting with Daniel Bates on Telegram through his Philanthropy bot. "
+            "Talk exactly as you normally would as a general assistant: warm, natural, helpful on any topic, and brief "
+            "enough for a phone. Never use profanity.\n\n"
+            "You also run the Do Good Factory, which fixes open-source GitHub issues. Nothing is "
+            "posted to GitHub unless Daniel approves that specific request.\n"
+            "Read Daniel loosely, including emojis, stickers and reactions: 👍 ✅ 👌 🙌 🚀 💯 or "
+            "\"sure\"/\"do it\" usually mean yes; 👎 ❌ 🚫 🗑️ or \"nah\" usually mean no; "
+            "▶️ means start, ⏹️ ⏸️ 🛑 mean stop. Use the conversation to decide what an emoji refers to.\n"
+            "To act, put each action on its own line as `CMD: <action>`, where action is one of: "
+            "status, start, stop, pending, yes <n>, no <n>. You may add a short normal reply too. "
+            "Only approve or reject when it is clear which request Daniel means; if several are "
+            "waiting and it is unclear, ask. Don't take an action Daniel didn't ask for.\n"
+            "Interpret intent, not keywords: \"how's it going\", \"anything new?\", \"what's up with the factory\" "
+            "mean status; \"fire it up\", \"get to work\" mean start; \"take a break\", \"shut it down\" mean stop. "
+            "Never reply with a command menu or list of keywords; just talk. Don't use markdown headers.\n\n"
+            f"FACTORY STATUS:\n{self._status_text()}\n\n"
+            f"REQUESTS WAITING FOR DANIEL:\n{waiting_text}\n"
+            + (f"\nDaniel is replying or reacting to this message:\n{reply_text[:1500]}\n" if reply_text else "")
         )
-        if context:
-            system_prompt += f"\n{context}\n"
-
-        full_prompt = f"Daniel: {text}"
-
+        contents = [
+            {"role": "user" if m["role"] == "user" else "model", "parts": [{"text": m["text"]}]}
+            for m in self.conversation
+        ]
+        contents.append({"role": "user", "parts": [{"text": text}]})
+        from src.llm import model_for, provider, gemini_generate, complete
+        model = model_for("chat")
         try:
-            cmd = [
-                "claude", "-p", full_prompt,
-                "--system-prompt", system_prompt,
-                "--model", "haiku",
-                "--allowedTools", "Bash,Read,Glob,Grep",
-                "--add-dir", PROJECT_DIR,
-                "--no-session-persistence",
-            ]
-
-            print(f"[{ts}] -> claude -p (haiku)...", flush=True)
-            env = {k: v for k, v in os.environ.items()
-                   if "CLAUDE" not in k.upper()}
-            env["PATH"] = os.environ.get("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
-            env["HOME"] = os.environ.get("HOME", "/Users/daniel")
-
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=120,
-                cwd=PROJECT_DIR, env=env,
-            )
-
-            response = result.stdout.strip()
-            if result.returncode != 0 or not response:
-                stderr = result.stderr.strip()
-                print(f"[{ts}] Claude error (rc={result.returncode}): {stderr[:200]}", flush=True)
-                # Don't send error to user — just log it
-                return
-
-            print(f"[{ts}] <- {response[:120]}", flush=True)
-            self.conversation.append({"role": "assistant", "text": response[:500]})
-
-            for i in range(0, len(response), 4000):
-                notify_plain(response[i:i + 4000])
-
-        except subprocess.TimeoutExpired:
-            print(f"[{ts}] Claude timed out (120s)", flush=True)
+            if provider(model) == "gemini":
+                answer = gemini_generate(model, contents, system)
+            else:
+                history = "\n".join(f"{'Daniel' if c['role'] == 'user' else 'You'}: {c['parts'][0]['text']}"
+                                     for c in contents)
+                answer = complete("chat", history, system=system, timeout=120)
         except Exception as e:
-            print(f"[{ts}] Error: {e}", flush=True)
+            print(f"  [CHAT] {model} error: {e}", flush=True)
+            return None
+
+        results, lines = [], []
+        for line in answer.splitlines():
+            m = re.match(r"^\s*`?CMD:\s*(.+?)`?\s*$", line)
+            if m:
+                results.append(self._run_command(m.group(1)) or f"(couldn't do: {m.group(1)})")
+            else:
+                lines.append(line)
+        reply = "\n".join(lines).strip()
+        if not results:
+            return reply
+        # Second pass: let the AI tell Daniel what happened in plain conversation,
+        # instead of dumping raw command output.
+        followup = contents + [
+            {"role": "model", "parts": [{"text": answer}]},
+            {"role": "user", "parts": [{"text": "(system) The actions ran. Results:\n" + "\n---\n".join(results)
+             + "\nNow reply to Daniel conversationally, like a friend giving a quick update. Summarize what matters "
+               "in plain words (no raw labels like 'factory: on', no command lists, no CMD lines). "
+               "If a request is waiting, say what it is and that he can just say yes or no."}]},
+        ]
+        try:
+            if provider(model) == "gemini":
+                spoken = gemini_generate(model, followup, system)
+            else:
+                spoken = complete("chat", followup[-1]["parts"][0]["text"], system=system, timeout=120)
+            spoken = "\n".join(l for l in spoken.splitlines() if not re.match(r"^\s*`?CMD:", l)).strip()
+            return spoken or "\n\n".join(results)
+        except Exception as e:
+            print(f"  [CHAT] followup error: {e}", flush=True)
+            return "\n\n".join(x for x in [reply, *results] if x)
 
     def _poll_outbox(self):
         """Check outbox for responses from Claude Code session and send them."""

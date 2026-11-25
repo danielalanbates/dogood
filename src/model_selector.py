@@ -26,6 +26,29 @@ COMPLEX_KEYWORDS = {
 COMPLEX_LANGUAGES = {"rust", "c", "c++", "go", "java", "scala", "haskell"}
 SIMPLE_LANGUAGES = {"markdown", "yaml", "json", "css", "html", "toml"}
 
+# --- Legacy Haiku Filters (DEPRECATED) ---
+# Kept for backward compatibility with db.py query filters.
+# All issues now use opus-high (Claude Opus 4.6 with extended thinking).
+# These filters are no longer used for model selection but may still be
+# referenced by the issue selection query for quality filtering.
+HAIKU_FILTERS = {
+    "min_body_length": 200,
+    "min_comments": 0,
+    "max_complexity": 0.50,
+    "exclude_labels": {
+        "enhancement", "feature", "feature-request", "feature request",
+        "refactor", "refactoring", "performance", "security",
+        "breaking", "breaking-change", "architecture", "design",
+        "migration", "api", "api-change",
+    },
+    "exclude_languages": COMPLEX_LANGUAGES,
+    "prefer_labels": {
+        "bug", "typo", "docs", "documentation", "good first issue",
+        "good-first-issue", "easy", "beginner", "help wanted", "help-wanted",
+        "low-hanging-fruit", "trivial",
+    },
+}
+
 
 def score_complexity(issue: dict, repo: dict = None) -> float:
     """Score issue complexity from 0.0 (trivial) to 1.0 (very complex).
@@ -113,33 +136,63 @@ def score_complexity(issue: dict, repo: dict = None) -> float:
     return round(min(max(total, 0.0), 1.0), 4)
 
 
-def select_tier(complexity: float, issue_id: int = None, conn = None) -> dict:
+def is_haiku_eligible(issue: dict, repo: dict = None, complexity: float = None) -> bool:
+    """Check if an issue is simple enough for haiku-high to handle.
+
+    Returns True only if the issue passes all haiku filters:
+    - Complexity score below threshold
+    - No excluded labels (enhancement, refactor, security, etc.)
+    - Not in a complex language (Rust, C, C++, Go, Java, etc.)
+    - Has enough body context
+    """
+    # Complexity gate
+    max_cx = HAIKU_FILTERS.get("max_complexity", 0.35)
+    if complexity is not None and complexity > max_cx:
+        return False
+
+    # Body length gate
+    body_len = len(issue.get("body") or "")
+    if body_len < HAIKU_FILTERS.get("min_body_length", 200):
+        return False
+
+    # Label exclusion gate
+    labels_raw = issue.get("labels") or "[]"
+    if isinstance(labels_raw, str):
+        try:
+            labels = {l.lower() for l in json.loads(labels_raw)}
+        except (json.JSONDecodeError, TypeError):
+            labels = set()
+    else:
+        labels = {l.lower() for l in labels_raw}
+
+    if labels & HAIKU_FILTERS.get("exclude_labels", set()):
+        return False
+
+    # Language exclusion gate
+    language = (repo or {}).get("language", "") or ""
+    exclude_langs = HAIKU_FILTERS.get("exclude_languages", set())
+    if language.lower() in {l.lower() for l in exclude_langs}:
+        return False
+
+    return True
+
+
+def select_tier(complexity: float, issue_id: int = None, conn=None,
+                issue: dict = None, repo: dict = None) -> dict:
     """Select the appropriate model tier based on complexity score.
 
-    Maps complexity to tier index proportionally across available tiers.
+    All issues use opus-high (Claude Opus 4.6 with extended thinking).
+    Opus budget per issue is still enforced to prevent infinite retries.
     """
     tiers = load_model_tiers()
-    n = len(tiers)
+    tier_idx = 0
 
-    if complexity <= 0.40:
-        tier_idx = 0
-    elif complexity <= 0.55:
-        tier_idx = min(1, n - 1)
-    elif complexity <= 0.75:
-        tier_idx = min(n - 2, n - 1)
-    else:
-        tier_idx = n - 1
-
-    # Enforce opus budget per issue
-    if "opus" in tiers[tier_idx]["model"] and issue_id and conn:
+    # Enforce opus budget per issue (cap retries on the same issue)
+    if issue_id and conn:
         from src.db import get_opus_attempts_for_issue
         opus_attempts = get_opus_attempts_for_issue(conn, issue_id)
         if opus_attempts >= MAX_OPUS_PER_ISSUE:
-            # Find highest non-opus tier
-            for i in range(tier_idx - 1, -1, -1):
-                if "opus" not in tiers[i]["model"]:
-                    tier_idx = i
-                    break
+            return None  # Exhausted attempts on this issue
 
     return tiers[tier_idx].copy()
 
@@ -161,3 +214,122 @@ def get_tier_by_number(tier_num: int) -> dict | None:
         if t["tier"] == tier_num:
             return t.copy()
     return None
+
+
+def estimate_merge_probability(issue: dict, repo: dict, conn=None) -> tuple[float, list[str]]:
+    """Estimate the probability that a submitted PR will be merged.
+
+    Based on empirical analysis of 192 submitted PRs:
+    - 2.6% overall merge rate (3 merges / 113 strikes)
+    - help-wanted issues: 0.5 avg strikes vs 1.3 without
+    - Repos with prior merges: near-guaranteed acceptance
+    - Repos with ≥3 strikes: near-guaranteed rejection
+
+    Returns (probability, reasons) where reasons explain the score.
+    """
+    reasons = []
+
+    # --- Parse labels ---
+    labels_raw = issue.get("labels") or "[]"
+    if isinstance(labels_raw, str):
+        try:
+            labels = {l.lower() for l in json.loads(labels_raw)}
+        except (json.JSONDecodeError, TypeError):
+            labels = set()
+    else:
+        labels = {l.lower() for l in labels_raw}
+
+    has_help_wanted = bool(labels & {"help wanted", "help-wanted"})
+
+    # --- Get repo strike/merge history ---
+    repo_merges = 0
+    repo_strikes = 0
+    if conn:
+        try:
+            repo_id = repo.get("id") or repo.get("rid")
+            if repo_id:
+                row = conn.execute(
+                    "SELECT merges, strikes FROM repo_strikes WHERE repo_id = ?",
+                    (repo_id,)
+                ).fetchone()
+                if row:
+                    repo_merges = row["merges"] or 0
+                    repo_strikes = row["strikes"] or 0
+        except Exception:
+            pass
+
+    # --- Scoring ---
+    # Base probability depends on whether repo invited contributions
+    if has_help_wanted:
+        prob = 0.45
+        reasons.append("+0.45 base (help-wanted label)")
+    else:
+        prob = 0.10
+        reasons.append("+0.10 base (no help-wanted)")
+
+    # Prior merge relationship is the strongest positive signal
+    if repo_merges > 0:
+        bonus = min(0.30, repo_merges * 0.15)
+        prob += bonus
+        reasons.append(f"+{bonus:.2f} prior merges ({repo_merges})")
+
+    # Strike history is the strongest negative signal
+    if repo_strikes >= 5:
+        prob -= 0.50
+        reasons.append(f"-0.50 high strikes ({repo_strikes})")
+    elif repo_strikes >= 3:
+        prob -= 0.30
+        reasons.append(f"-0.30 moderate strikes ({repo_strikes})")
+    elif repo_strikes >= 1:
+        prob -= 0.15
+        reasons.append(f"-0.15 has strikes ({repo_strikes})")
+    elif repo_strikes == 0:
+        # Zero strikes = welcoming repo (either new or tolerant)
+        prob += 0.10
+        reasons.append("+0.10 zero strikes (welcoming repo)")
+        # Extra bonus if we've submitted before and they haven't complained
+        if conn:
+            try:
+                repo_id = repo.get("id") or repo.get("rid")
+                if repo_id:
+                    prior = conn.execute(
+                        "SELECT COUNT(*) FROM contributions WHERE repo_id = ? AND status = 'pr_created'",
+                        (repo_id,)
+                    ).fetchone()[0]
+                    if prior >= 2:
+                        prob += 0.05
+                        reasons.append(f"+0.05 tolerant repo ({prior} prior PRs, 0 strikes)")
+            except Exception:
+                pass
+
+    # Issue context quality
+    body_len = len(issue.get("body") or "")
+    comments = issue.get("comments_count") or 0
+
+    if body_len >= 500:
+        prob += 0.05
+        reasons.append("+0.05 good body length")
+    elif body_len < 100:
+        prob -= 0.05
+        reasons.append("-0.05 very short body")
+
+    if comments >= 3:
+        prob += 0.05
+        reasons.append("+0.05 well-discussed issue")
+    elif comments == 0:
+        prob -= 0.05
+        reasons.append("-0.05 zero comments")
+
+    # Enhancement/feature labels are harder to get merged
+    if labels & {"enhancement", "feature", "feature-request", "feature request"}:
+        prob -= 0.15
+        reasons.append("-0.15 enhancement/feature label")
+
+    # Mega-repos without help-wanted are risky
+    stars = repo.get("stars") or 0
+    if stars > 100000 and not has_help_wanted:
+        prob -= 0.05
+        reasons.append("-0.05 mega-repo without help-wanted")
+
+    prob = round(max(0.0, min(1.0, prob)), 2)
+    return prob, reasons

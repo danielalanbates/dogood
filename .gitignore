@@ -41,6 +41,7 @@ build/
 Thumbs.db
 
 # Project specific
+.build/
 /workdir/
 /tmp/
 scanned repos/
