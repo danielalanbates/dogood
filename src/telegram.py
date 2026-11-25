@@ -54,7 +54,7 @@ if not BOT_TOKEN or not CHAT_ID:
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 API_URL = f"{BASE_URL}/sendMessage" if BASE_URL else ""
 
-PROJECT_DIR = "/Users/daniel/Library/Mobile Documents/com~apple~CloudDocs/Code/Tools/github-helper"
+PROJECT_DIR = str(Path(__file__).resolve().parent.parent)
 
 TELEGRAM_INBOX = "/tmp/telegram-inbox.jsonl"
 TELEGRAM_OUTBOX = "/tmp/telegram-outbox.jsonl"

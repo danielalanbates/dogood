@@ -46,3 +46,6 @@ Thumbs.db
 /tmp/
 scanned repos/
 *.log
+
+# Local scan output (holds machine paths)
+*_log.txt

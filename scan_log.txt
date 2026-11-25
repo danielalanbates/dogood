@@ -1,4 +1,0 @@
-  File "/Volumes/X10 Pro danielalanbatesatgmail.com /AIcode/github-helper/src/scan_dump.py", line 40
-    query = \"\"\"
-             ^
-SyntaxError: unexpected character after line continuation character

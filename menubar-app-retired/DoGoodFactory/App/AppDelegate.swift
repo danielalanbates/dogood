@@ -224,8 +224,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Run the factory scan command to populate the issue database
     private func runFactoryScan() {
         let process = Process()
-        let venvPython = "/Volumes/X10 Pro danielalanbatesatgmail.com /AIcode/12-AI_Coding_Tools/github-helper/.venv/bin/python3.14"
-        let workDir = "/Volumes/X10 Pro danielalanbatesatgmail.com /AIcode/12-AI_Coding_Tools/github-helper"
+        let workDir = ProcessInfo.processInfo.environment["DOGOOD_DIR"] ?? (NSHomeDirectory() + "/AIcode/github-helper")
+        let venvPython = workDir + "/.venv/bin/python3.14"
 
         process.executableURL = URL(fileURLWithPath: venvPython)
         process.arguments = ["-m", "src.cli", "scan", "--min-stars", "1000"]
@@ -233,8 +233,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Build environment from factory plist so scan has all needed tokens
         var env: [String: String] = [
-            "HOME": "/Users/daniel",
-            "PATH": "/Users/daniel/.nvm/versions/node/v22.22.0/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+            "HOME": NSHomeDirectory(),
+            "PATH": "\(NSHomeDirectory())/.nvm/versions/node/v22.22.0/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
             "VIRTUAL_ENV": "\(workDir)/.venv",
             "PYTHONUNBUFFERED": "1"
         ]

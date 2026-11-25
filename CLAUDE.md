@@ -4,7 +4,7 @@
 Autonomous agent that finds social-good open-source projects, ranks them by impact/need/kindness, prioritizes issues, and creates pull requests to fix bugs using AI assistance.
 
 ## Working Directory
-This project lives on the X10 drive at `/Users/daniel/X10/AIcode/dogood/`.
+This project lives on the X10 drive at `~/X10/AIcode/dogood/`.
 
 ## Communication Protocol
 
@@ -99,7 +99,7 @@ The built-in solver (`src/solver.py`) uses Claude Code SDK with model tier selec
 
 ## Git Identity
 - Username: `danielalanbates`
-- Email: `danielalanbates@gmail.com`
+- Email: `daniel@batesai.org`
 - Name: `Daniel Bates`
 - Always use real name/email for commits (not placeholder)
 
@@ -160,7 +160,7 @@ The built-in solver (`src/solver.py`) uses Claude Code SDK with model tier selec
 ### Actions:
 - **CLA required + NOT signed:** SKIP the repo entirely. Do not fork, clone, or PR.
 - **CLA required + signed:** Proceed normally.
-- **DCO required:** Add `Signed-off-by: Daniel Bates <danielalanbates@gmail.com>` to ALL commit messages.
+- **DCO required:** Add `Signed-off-by: Daniel Bates <daniel@batesai.org>` to ALL commit messages.
 - **Neither:** Proceed normally.
 
 ### CLAs we have signed:
